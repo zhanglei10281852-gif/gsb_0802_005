@@ -15,6 +15,8 @@
 2. **从应用调用 `send()`，到对端真正 `message`，中间隔着三个本质不同的边界。** 其中只有"写入本地 socket"由 `send()` 的回调通知，而"对端实际收到"本库无法感知（见第 3 节）。
 3. **压缩是异步的。** 对大消息，`send()` 返回时数据可能仍在 zlib 线程里压缩，此时既没有组帧、也没有写 socket；`close()` 此刻调用，close 帧只是排在后面等待（见场景 B）。
 4. **`terminate()` 与 `close()` 完全不同。** `terminate()` 立即 `socket.destroy()`，会中断正在进行的压缩，`send()` 回调收到错误，数据不会发出（见场景 C）。这是唯一会导致"已被发送层接收但最终没写入 socket"的路径。
+5. **对端先关闭也分两种：** 对端优雅 `close()`（场景 F/G）不会丢弃本地正在压缩/排队的数据——收到对端 close 只是让本地回一个 close 帧（同样排队），接收端也只丢弃它自己 close 帧**之后**到达的字节；对端 `terminate()`/RST（场景 H）会销毁本地 socket，压缩中的消息回调报错、不会发出。
+6. **台账可记的只有"本机已接收"和"本机已发出"两种状态；"对端已送达"只能来自应用层 ACK。** 详见 3.1 记账矩阵与 3.2 时序对照表。
 
 ---
 
@@ -146,11 +148,47 @@ return this._socket._writableState.length + this._sender._bufferedBytes;
 
 它是 `socket` 写队列字节 + `Sender` 排队/压缩中**未压缩**字节之和。可作背压参考，但它混合了两种不同口径的计数，且为 0 只代表"没有待写字节"，不代表对端已收。
 
+### 3.1 投递台账记账矩阵（接入团队直接照此记账）
+
+把发送回调接到台账时，只有下面两种状态与本库实际能观测的信号一一对应：
+
+| 台账状态 | 何时可记 | 依据的信号 | 绝不能写成 |
+|----------|----------|------------|------------|
+| **本机已接收（已被发送层接管）** | `ws.send()` 同步返回后即可记 | 调用正常返回，未抛 `WebSocket is not open`；此时 `Sender._state` 通常为 `DEFLATING` 或任务已入 `_queue`，`ws.bufferedAmount` 增加 | 不能写成"已发送/已送达"。此时进程崩溃或 `terminate()` 都会丢。 |
+| **本机已发出（已写入本地 socket）** | `send(data, cb)` 的 **cb 被调用且 err 为 null** 时记 | `socket.write` 回调无错；`ws.bufferedAmount` 已相应下降 | **绝不能写成"对端已送达/对端已收到"。** 回调只证明字节离开 Node 进入本机内核，对端可能还没读、没解析、没处理。 |
+
+回调的另外两种结果：
+
+- **cb 收到 Error**：这笔消息**未到达边界②**，应记为"发送失败/未送达"。典型错误文案：
+  - `"The socket was closed while data was being compressed"`（场景 C/H：本地或对端在压缩期间销毁了 socket）。
+  - `"WebSocket is not open: readyState 2/3 (CLOSING/CLOSED)"`（在 `close()` 之后才调用 `send()`，走 [sendAfterClose](file:///e:/newGsb/questions/GSB-005/Tony/lib/websocket.js#L1138-L1159)）。
+  - `ECONNRESET`/`EPIPE` 等系统错误（数据可能已过边界②但连接随后被重置）。
+- **cb 从未被调用**：消息停留在边界①之后、边界②之前（仍在压缩或排队）。此时连接最终是优雅关闭则 cb 随后会以无错触发；是异常销毁则以错误触发。不要在 cb 触发前假设任何结果。
+
+**台账里的"对端已送达"只能由应用层 ACK 驱动**，不能由任何 ws 回调或 `'close'` 事件驱动。下一节的时序对照表把每种关闭方式下，排队中/压缩中/已写 socket 的消息分别会怎样列清楚。
+
+### 3.2 各关闭时序下的消息命运对照表
+
+下表的"在压缩中"指数据已进入 `dispatch` 但 zlib 回调尚未返回；"在队列中"指排在 `_queue` 里等待；"已写 socket"指已过边界②。
+
+| 关闭时序 | 在压缩中的数据 | 在队列中的数据 | 已写 socket 的数据 | `send` 回调结果 | 对端能否收到 message |
+|----------|----------------|----------------|--------------------|-----------------|---------------------|
+| **本地 `close()`（优雅，场景 A/B/D/G）** | 压缩继续，完成后照常组帧、写 socket | 按 FIFO 依次发送，close 帧排最后 | 留在内核缓冲并被 `socket.end()` 冲刷 | 全部无错（err=null） | 通常能（字节先于 close/FIN 到达）；但是否被对端应用处理属边界③，库不保证 |
+| **本地 `terminate()`（场景 C）** | 立即中断；压缩回调检测到 `socket.destroyed`，**不写 socket** | 队列里其余任务被 [callCallbacks](file:///e:/newGsb/questions/GSB-005/Tony/lib/sender.js#L585-L594) 全部以错误回调 | 可能已发部分，但 `socket.destroy()` 发 RST，在途字节可能被丢弃 | 当前消息及队列回调均收到 `"The socket was closed while data was being compressed"` | 不能保证；已发部分也可能因 RST 丢失，对端 close code=1006 |
+| **对端优雅 `close()`，本地未关（场景 F）** | 压缩继续；对端 close 触发本地回 close 帧并入队 | 按 FIFO 发送，回 close 帧排最后 | 冲刷发出 | 无错 | 对端能收到 close 帧之前已到达的数据帧；之后的字节被 receiver 丢弃 |
+| **双方同时优雅 `close()`（场景 G）** | 压缩继续，完成后发送 | 按 FIFO 发送 | `socket.end()` 冲刷 | 无错 | 同上，通常能收到在途数据；边界③不保证 |
+| **对端 `terminate()`/RST（场景 H）** | 本地 socket 被 RST 销毁；压缩回调检测到 destroyed，**不写 socket** | 队列任务以错误回调 | 若 RST 在 write 之后到达，回调可能无错也可能报 `ECONNRESET`（依平台/时序） | 当前消息通常报错；已写部分结果不确定 | 不能保证，对端 close code=1006 |
+
+需要强调两点（结论不随新场景改变）：
+
+1. **回调成功永远不等于对端收到。** 即便在 F/G 这种"对端确实收到了"的回环实验里，回调成功的语义也只是边界②；跨机器高延迟、对端慢消费或 RST 时，回调成功与对端 message 之间没有因果保证。
+2. **优雅关闭（无论哪一方发起）不主动丢弃发送队列里的数据；强制终止才会。** 这是代码里 `close()`→`sender.close()`→入队 与 `terminate()`→`socket.destroy()` 两条路径的本质区别。
+
 ---
 
 ## 4. 复现场景与观察结果
 
-脚本 [test/close-during-compression-repro.js](file:///e:/newGsb/questions/GSB-005/Tony/test/close-during-compression-repro.js) 只用仓库自身的 `WebSocket`/`WebSocketServer` 与 Node 内置模块，通过包装（非修改）`Sender.dispatch`/`sendFrame` 打点，启动真实本地 server/client。共 5 个场景。
+脚本 [test/close-during-compression-repro.js](file:///e:/newGsb/questions/GSB-005/Tony/test/close-during-compression-repro.js) 只用仓库自身的 `WebSocket`/`WebSocketServer` 与 Node 内置模块，通过包装（非修改）`Sender.dispatch`/`sendFrame` 打点，启动真实本地 server/client。共 8 个场景（A–E 覆盖本地关闭方向，F–H 覆盖对端关闭方向）。
 
 ### 场景 A：发完压缩大快照后立即优雅关闭（对端正常读）
 
@@ -267,6 +305,95 @@ CLIENT RECEIVED close code=1000
 - `send` 回调成功（边界②）后 200ms，对端才真正收到 message（边界③）。这 200ms 里数据停留在本机/对端内核缓冲，`socketWritableLength` 在 Node 侧已经是 0（字节已离开 Node），但对端 `message` 事件尚未触发。
 - 这正面说明：**回调成功不构成对端收到的证据**；在慢消费者/网络拥塞时，边界②到③之间可能有显著延迟，若此期间连接被 RST 或进程崩溃，已"写入本地 socket"的数据仍可能无法到达对端应用。
 
+### 场景 F：对端在本地压缩尚未结束时优雅关闭（本地未调用 close）
+
+本地（服务端）发出 16 MiB 不可压缩快照后，**不调用** `close()`；对端（客户端）在压缩进行中（约 5ms 后）调用 `close(1000)`。
+
+```
+SERVER send() returned; sender.state=1 (DEFLATING). PEER will now close() ...
+CLIENT calling close() while server compresses
+SERVER state right before client close arrives: sender.state=1 queueLen=1
+       closeFrameReceived=true                       # 对端 close 帧在压缩完成前就到了
+... (压缩继续，约 560ms)
+SERVER -> sendFrame opcode=2 rsv1=1 frameBytes=16782342
+SERVER -> sendFrame opcode=8 ...                     # 收到对端 close 后，本地自动回 close
+SERVER    socket.write CB opcode=2 err=null
+SERVER data send() CALLBACK: ok; readyState=2 closeFrameSent=false closeFrameReceived=true
+SERVER    socket.write CB opcode=8 err=null
+SERVER 'close' EVENT code=1000 reason=peer closing
+CLIENT RECEIVED message bytes=16777216               # 对端仍然收到了数据
+CLIENT 'close' EVENT code=1000 reason=peer closing
+RESULT: server data callback=ok; client received 1 data frame(s); both closed
+```
+
+为什么会这样（实现机制）：
+
+1. 对端 close 帧到达后，[receiverOnConclude](file:///e:/newGsb/questions/GSB-005/Tony/lib/websocket.js#L1168-L1182) 置 `_closeFrameReceived=true`，并**自动调用本地 `ws.close()`** 回一个 close 帧。
+2. 此刻本地 Sender 仍处于 `DEFLATING`，所以这个回 close 帧被 `enqueue` 到正在压缩的数据帧**之后**（`queueLen=1`），不会打断压缩。
+3. 压缩完成后，数据帧先 `sendFrame`，随后回 close 帧；两个写入都成功，`send` 回调无错。
+4. 对端的 [Receiver](file:///e:/newGsb/questions/GSB-005/Tony/lib/receiver.js#L96-L98) 在解析完自己的 close 帧后，只**丢弃 close 帧之后**到达的字节（`_opcode === 0x08` 时直接 `cb()` 不再解析）。由于本地数据帧在网络上**先于**对端自己发出的 close 帧到达（对端 close 是在压缩期间才发出，而本地数据帧在压缩完成后才发出——在本机回环场景里二者顺序仍由 TCP 保证），所以对端照常收到并 emit `message`。
+
+结论：**"对端先关"不等于本地排队/压缩中的数据会被丢弃。** 只要是优雅关闭、且数据字节在对端 close 帧之前进入对端内核，对端就会投递该 message。但这一点依赖网络字节序与对端读取时机，跨机器/高延迟下并非强保证（见第 4.7 节）。
+
+### 场景 G：双方在压缩进行中同时优雅关闭
+
+与 F 类似，但本地也在约 5ms 时调用 `close(1001)`，形成双方几乎同时关闭。
+
+```
+SERVER send() returned; sender.state=1. BOTH sides will close() ...
+SERVER calling close() / CLIENT calling close()
+... (压缩继续)
+SERVER -> sendFrame opcode=2 ... frameBytes=16782342
+SERVER -> sendFrame opcode=8 ... frameBytes=19
+SERVER    socket.write CB opcode=2 err=null
+SERVER data send() CALLBACK: ok
+SERVER    socket.write CB opcode=8 err=null
+SERVER 'close' EVENT code=1000
+CLIENT RECEIVED message bytes=16777216
+CLIENT 'close' EVENT code=1001 reason=server going away
+RESULT: server data callback=ok; client received 1 data frame(s)
+```
+
+为什么会这样：
+
+1. 本地 `close()` 把本地 close 帧排进队列；对端 close 帧到达后又触发一次 `close()`，但 [close()](file:///e:/newGsb/questions/GSB-005/Tony/lib/websocket.js#L310-L319) 在 `CLOSING` 状态下是幂等的：当 `_closeFrameSent && _closeFrameReceived` 时直接 `socket.end()`。
+2. 关键在 close 帧写出回调：[websocket.js#L327-L337](file:///e:/newGsb/questions/GSB-005/Tony/lib/websocket.js#L327-L337)。当回 close 帧写完（`_closeFrameSent=true`）且 `_closeFrameReceived=true` 时，立即 `socket.end()`。`socket.end()` 是**半关闭写侧**，它会先把内核发送缓冲里已有的字节冲刷出去再发 FIN，因此数据帧不丢、`send` 回调无错。
+3. 对端同样：先读到数据帧并 emit `message`，再读到 close 帧。
+
+结论：双方同时优雅关闭时，**已进入发送队列/已写 socket 的数据仍被冲刷，回调成功**；但"对端应用是否处理"仍属边界③，库不保证。这进一步印证了"回调成功 ≠ 对端收到"——这里回调成功只是因为内核成功接收了字节。
+
+### 场景 H：对端在压缩进行中强制终止（RST）
+
+对端在压缩中调用 `terminate()`，直接 `socket.destroy()`，这会向本地发送 TCP RST。
+
+```
+SERVER send() returned; sender.state=1. PEER will terminate() (RST) ...
+CLIENT calling terminate() while server compresses
+SERVER data send() CALLBACK: error: The socket was closed while data was being compressed;
+       socketDestroyed=true
+SERVER 'close' EVENT code=1006
+CLIENT 'close' EVENT code=1006
+RESULT: server data callback=error; server error event=false; client received 0 data frame(s)
+```
+
+为什么会这样：
+
+1. 对端 RST 使本地 socket 立即 `destroyed`。这里 socket 的 `'close'`/`'error'` 事件先于压缩回调触发（注意：此时 Sender 仍在 `DEFLATING`，队列里还没有本地 close 帧，因为本地没调用 close）。
+2. 压缩完成回调在 [dispatch](file:///e:/newGsb/questions/GSB-005/Tony/lib/sender.js#L513-L521) 里检测到 `this._socket.destroyed`，构造 `"The socket was closed while data was being compressed"` 错误，交给 `send` 回调，并**不调用 `sendFrame`**，数据帧彻底不发。
+3. 对端没有收到任何数据帧（`client received 0`），双方 close code 都是 1006（异常关闭）。
+4. 本场景里没有额外的 `'error'` 事件：是因为错误通过 `send` 回调返回，且 socket 销毁走的是 close 路径。是否会额外 emit `'error'` 取决于 RST 被 Node 报告为 socket `'error'` 还是仅 `'close'`，存在时序/平台差异（本环境 Windows + Node 22 表现为只走 close）。
+
+结论：**对端强制终止是真正可能丢消息的情形。** 此时"已被发送层接收"（边界①）的数据既到不了边界②也到不了边界③，`send` 回调以错误返回是台账判定"未送达"的可靠信号。
+
+> 时序提示：若数据已经 `sendFrame`/`socket.write`（已过边界②）之后 RST 才到达，回调是否报错取决于操作系统何时把 RST 通知给本次 write——可能是回调成功但随后 socket `'error'`/`'close'`(1006)，也可能是回调直接收到 `ECONNRESET`。因此**回调成功仍不能在异常关闭场景下作为送达凭证**。
+
+### 4.7 对端关闭方向的两个事实（解释"为何这样设计"）
+
+1. **接收端只丢弃自己 close 帧之后的字节**：[receiver.js#L97](file:///e:/newGsb/questions/GSB-005/Tony/lib/receiver.js#L96-L98)。这是为了让 close 帧之前已在途的数据帧能够被完整投递，符合 RFC 6455 "close 帧表示连接关闭起点"但不追溯丢弃已收数据的语义。
+2. **发送端不因为收到对端 close 就清空发送队列**：对端 close 只是触发本地回一个 close 帧（同样排队），不会取消前面排队的数据。[socketOnEnd](file:///e:/newGsb/questions/GSB-005/Tony/lib/websocket.js#L1384-L1390) 里的 `this.end()` 也只在 receiver.end() 之后半关闭写侧，会冲刷已缓冲的发送数据。
+
+这两点合起来解释了 F/G 中"对端关了，本地数据照样发出去并被收到"。但它们都只在**优雅关闭**且**字节序有利**时成立；RST（H）或对端在数据到达前就停止读取并销毁，都会使数据丢失。
+
 ---
 
 ## 5. 给接入方的交付判断建议
@@ -296,6 +423,11 @@ CLIENT RECEIVED close code=1000
 5. **确认压缩确实生效**
    - 检查 `ws.extensions` 是否包含 `permessage-deflate`；未协商成功时 `compress` 选项被忽略，消息明文发送，"压缩大快照"的现场判断前提可能不成立。
 
+6. **对端发起关闭时的处理（本轮新增）**
+   - 收到对端优雅 `close()` 时，本库会自动回 close 帧并继续把发送队列里的数据冲刷出去（场景 F/G）。不要因为收到了对端 close 就假设"本地刚发的快照丢了"——应仍以 `send` 回调判断边界②，以应用层 ACK 判断边界③。
+   - 若 socket 报 `'error'`（如 `ECONNRESET`）或 `'close'` 的 code 为 1006，说明对端是异常断开（场景 H）。此时压缩中/队列中的消息可能未发出，已写 socket 的也可能丢失，台账中这些消息应回退为"未确认/可能丢失"，等待业务层对账或重发，而不是根据之前是否回调成功来记"已送达"。
+   - 记账状态机建议：`send()` 返回 → "本机已接收"；回调无错 → "本机已发出"；回调有错或异常 close(1006) → "发送失败/未确认"；收到应用层 ACK → "对端已送达"。前三个状态都不能跃迁到最后一个。
+
 ---
 
 ## 6. 涉及的关键代码位置
@@ -314,3 +446,9 @@ CLIENT RECEIVED close code=1000
 - 异步压缩与并发限流：[permessage-deflate.js compress()](file:///e:/newGsb/questions/GSB-005/Tony/lib/permessage-deflate.js#L322-L329) / [_compress()](file:///e:/newGsb/questions/GSB-005/Tony/lib/permessage-deflate.js#L404-L460)
 - 关闭时压缩流清理：[cleanup()](file:///e:/newGsb/questions/GSB-005/Tony/lib/permessage-deflate.js#L130-L150)
 - 服务端扩展协商：[websocket-server.js handleUpgrade](file:///e:/newGsb/questions/GSB-005/Tony/lib/websocket-server.js#L298-L321)
+- 收到对端 close 帧的处理：[receiverOnConclude](file:///e:/newGsb/questions/GSB-005/Tony/lib/websocket.js#L1168-L1182)
+- 接收端丢弃 close 帧之后的字节：[receiver.js _write()](file:///e:/newGsb/questions/GSB-005/Tony/lib/receiver.js#L96-L98)
+- 接收端 control 帧解析与 conclude 触发：[receiver.js controlMessage()](file:///e:/newGsb/questions/GSB-005/Tony/lib/receiver.js#L653-L701)
+- 对端 FIN 时半关闭并冲刷发送数据：[socketOnEnd](file:///e:/newGsb/questions/GSB-005/Tony/lib/websocket.js#L1384-L1390)
+- socket 关闭时排空缓冲并结束 receiver：[socketOnClose](file:///e:/newGsb/questions/GSB-005/Tony/lib/websocket.js#L1321-L1365)
+- Sender 出错时 end() 而非 destroy()：[senderOnError](file:///e:/newGsb/questions/GSB-005/Tony/lib/websocket.js#L1281-L1301)

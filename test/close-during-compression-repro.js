@@ -96,7 +96,10 @@ function runScenario(name, fn) {
       if (err) reject(err);
       else resolve();
     };
-    const timeout = setTimeout(() => done(new Error('scenario timed out')), 8000);
+    const timeout = setTimeout(
+      () => done(new Error('scenario timed out')),
+      8000
+    );
     const finish = (err) => {
       clearTimeout(timeout);
       done(err);
@@ -109,10 +112,9 @@ function scenarioA(finish) {
   const wss = new WebSocketServer(
     { port: 0, perMessageDeflate: { threshold: 0 } },
     () => {
-      const client = new WebSocket(
-        `ws://localhost:${wss.address().port}`,
-        { perMessageDeflate: true }
-      );
+      const client = new WebSocket(`ws://localhost:${wss.address().port}`, {
+        perMessageDeflate: true
+      });
 
       let serverWs;
       let receivedMessages = 0;
@@ -191,22 +193,18 @@ function scenarioB(finish) {
   const wss = new WebSocketServer(
     { port: 0, perMessageDeflate: { threshold: 0 } },
     () => {
-      const client = new WebSocket(
-        `ws://localhost:${wss.address().port}`,
-        { perMessageDeflate: true }
-      );
+      const client = new WebSocket(`ws://localhost:${wss.address().port}`, {
+        perMessageDeflate: true
+      });
 
       let serverWs;
       let receivedMessages = 0;
       let gotClose = false;
       let sendCallbackFired = false;
 
-      let paused = false;
-
       client.on('upgrade', () => {
         process.nextTick(() => {
           client._socket.pause();
-          paused = true;
           log('CLIENT', 'paused client socket (not reading from kernel)');
         });
       });
@@ -216,7 +214,10 @@ function scenarioB(finish) {
         attachProbes(ws, 'SERVER');
 
         const payload = makeIncompressiblePayload(HUGE_SIZE);
-        log('SERVER', `send() large incompressible snapshot, payloadBytes=${payload.length}`);
+        log(
+          'SERVER',
+          `send() large incompressible snapshot, payloadBytes=${payload.length}`
+        );
 
         ws.send(payload, { binary: true }, (err) => {
           sendCallbackFired = true;
@@ -252,14 +253,20 @@ function scenarioB(finish) {
               `nothing has been framed or written to the socket yet. ` +
               `The send() callback has not fired.`
           );
-          log('CLIENT', 'resuming client socket so it can read once frames are sent');
+          log(
+            'CLIENT',
+            'resuming client socket so it can read once frames are sent'
+          );
           client._socket.resume();
         }, 300);
       });
 
       client.on('message', (data) => {
         receivedMessages++;
-        log('CLIENT', `RECEIVED message #${receivedMessages} bytes=${data.length}`);
+        log(
+          'CLIENT',
+          `RECEIVED message #${receivedMessages} bytes=${data.length}`
+        );
       });
       client.on('close', (code) => {
         gotClose = true;
@@ -285,18 +292,15 @@ function scenarioC(finish) {
   const wss = new WebSocketServer(
     { port: 0, perMessageDeflate: { threshold: 0 } },
     () => {
-      const client = new WebSocket(
-        `ws://localhost:${wss.address().port}`,
-        { perMessageDeflate: true }
-      );
+      const client = new WebSocket(`ws://localhost:${wss.address().port}`, {
+        perMessageDeflate: true
+      });
 
-      let serverWs;
       let receivedMessages = 0;
       let gotClose = false;
       let sendCallbackErrored = false;
 
       wss.on('connection', (ws) => {
-        serverWs = ws;
         attachProbes(ws, 'SERVER');
 
         const payload = makePayload(LARGE_SIZE);
@@ -354,10 +358,9 @@ function scenarioD(finish) {
   const wss = new WebSocketServer(
     { port: 0, perMessageDeflate: { threshold: 0 } },
     () => {
-      const client = new WebSocket(
-        `ws://localhost:${wss.address().port}`,
-        { perMessageDeflate: true }
-      );
+      const client = new WebSocket(`ws://localhost:${wss.address().port}`, {
+        perMessageDeflate: true
+      });
 
       let serverWs;
       const received = [];
@@ -400,7 +403,10 @@ function scenarioD(finish) {
 
       client.on('message', (data) => {
         received.push(data.length);
-        log('CLIENT', `RECEIVED message #${received.length} bytes=${data.length}`);
+        log(
+          'CLIENT',
+          `RECEIVED message #${received.length} bytes=${data.length}`
+        );
       });
       client.on('close', (code) => {
         gotClose = true;
@@ -496,13 +502,19 @@ function scenarioE(finish) {
     client.on('open', () => {
       client._socket.pause();
       clientPaused = true;
-      log('CLIENT', 'paused client socket BEFORE server sends (slow consumer / backpressure)');
+      log(
+        'CLIENT',
+        'paused client socket BEFORE server sends (slow consumer / backpressure)'
+      );
       client.emit('paused');
     });
 
     client.on('message', (data) => {
       receivedMessages++;
-      log('CLIENT', `RECEIVED message #${receivedMessages} bytes=${data.length}`);
+      log(
+        'CLIENT',
+        `RECEIVED message #${receivedMessages} bytes=${data.length}`
+      );
     });
     client.on('close', (code) => {
       gotClose = true;
@@ -519,6 +531,271 @@ function scenarioE(finish) {
       }
     }, 30);
   });
+
+  wss.on('error', finish);
+}
+
+function scenarioF(finish) {
+  const wss = new WebSocketServer(
+    { port: 0, perMessageDeflate: { threshold: 0 } },
+    () => {
+      const client = new WebSocket(`ws://localhost:${wss.address().port}`, {
+        perMessageDeflate: true
+      });
+
+      let serverWs;
+      const clientReceived = [];
+      let serverDataCb = null;
+      let serverCloseEmitted = false;
+      let clientCloseEmitted = false;
+
+      wss.on('connection', (ws) => {
+        serverWs = ws;
+        attachProbes(ws, 'SERVER');
+        ws.on('close', (code, reason) => {
+          serverCloseEmitted = true;
+          log(
+            'SERVER',
+            `'close' EVENT code=${code} reason=${reason.toString()}`
+          );
+        });
+
+        const payload = makeIncompressiblePayload(HUGE_SIZE);
+        log(
+          'SERVER',
+          `send() large compressed snapshot, payloadBytes=${payload.length}`
+        );
+        ws.send(payload, { binary: true }, (err) => {
+          serverDataCb = err ? 'error: ' + err.message : 'ok';
+          log(
+            'SERVER',
+            `data send() CALLBACK: ${serverDataCb}; readyState=${ws.readyState} ` +
+              `closeFrameSent=${ws._closeFrameSent} closeFrameReceived=${ws._closeFrameReceived}`
+          );
+        });
+
+        log(
+          'SERVER',
+          `send() returned; sender.state=${ws._sender._state} (DEFLATING). ` +
+            `PEER (client) will now close() gracefully while we are still compressing.`
+        );
+
+        setTimeout(() => {
+          log(
+            'SERVER',
+            `state right before client close arrives: sender.state=${ws._sender._state} ` +
+              `queueLen=${ws._sender._queue.length} closeFrameReceived=${ws._closeFrameReceived}`
+          );
+        }, 10);
+      });
+
+      client.on('open', () => {
+        setTimeout(() => {
+          log(
+            'CLIENT',
+            'calling close() (peer-initiated graceful close) while server compresses'
+          );
+          client.close(1000, 'peer closing');
+        }, 5);
+      });
+      client.on('message', (data) => {
+        clientReceived.push(data.length);
+        log('CLIENT', `RECEIVED message bytes=${data.length}`);
+      });
+      client.on('close', (code, reason) => {
+        clientCloseEmitted = true;
+        log('CLIENT', `'close' EVENT code=${code} reason=${reason.toString()}`);
+      });
+
+      const check = setInterval(() => {
+        if (serverWs && serverCloseEmitted && clientCloseEmitted) {
+          clearInterval(check);
+          log(
+            'RESULT',
+            `peer graceful close during compression: server data callback=${serverDataCb}; ` +
+              `client received ${clientReceived.length} data frame(s); ` +
+              `both sides emitted 'close'. The queued data frame was still sent and ` +
+              `delivered because close() only queues; the receiver drops bytes that ` +
+              `arrive AFTER its close frame, not bytes already in flight before it.`
+          );
+          wss.close(() => {
+            client.terminate();
+            finish();
+          });
+        }
+      }, 30);
+    }
+  );
+
+  wss.on('error', finish);
+}
+
+function scenarioG(finish) {
+  const wss = new WebSocketServer(
+    { port: 0, perMessageDeflate: { threshold: 0 } },
+    () => {
+      const client = new WebSocket(`ws://localhost:${wss.address().port}`, {
+        perMessageDeflate: true
+      });
+
+      let serverWs;
+      let serverDataCb = null;
+      let serverCloseEmitted = false;
+      let clientCloseEmitted = false;
+      const clientReceived = [];
+
+      wss.on('connection', (ws) => {
+        serverWs = ws;
+        attachProbes(ws, 'SERVER');
+        ws.on('close', (code) => {
+          serverCloseEmitted = true;
+          log('SERVER', `'close' EVENT code=${code}`);
+        });
+
+        const payload = makeIncompressiblePayload(HUGE_SIZE);
+        log(
+          'SERVER',
+          `send() large compressed snapshot, payloadBytes=${payload.length}`
+        );
+        ws.send(payload, { binary: true }, (err) => {
+          serverDataCb = err ? 'error: ' + err.message : 'ok';
+          log('SERVER', `data send() CALLBACK: ${serverDataCb}`);
+        });
+
+        log(
+          'SERVER',
+          `send() returned; sender.state=${ws._sender._state}. ` +
+            `BOTH sides will close() while server is still compressing.`
+        );
+
+        setTimeout(() => {
+          log('SERVER', 'calling close() (simultaneous with peer close)');
+          ws.close(1001, 'server going away');
+        }, 5);
+      });
+
+      client.on('open', () => {
+        setTimeout(() => {
+          log('CLIENT', 'calling close() (simultaneous with server close)');
+          client.close(1000, 'client going away');
+        }, 5);
+      });
+      client.on('message', (data) => {
+        clientReceived.push(data.length);
+        log('CLIENT', `RECEIVED message bytes=${data.length}`);
+      });
+      client.on('close', (code, reason) => {
+        clientCloseEmitted = true;
+        log('CLIENT', `'close' EVENT code=${code} reason=${reason.toString()}`);
+      });
+
+      const check = setInterval(() => {
+        if (serverWs && serverCloseEmitted && clientCloseEmitted) {
+          clearInterval(check);
+          log(
+            'RESULT',
+            `simultaneous graceful close during compression: server data callback=${serverDataCb}; ` +
+              `client received ${clientReceived.length} data frame(s). When both sides have ` +
+              `already sent a close frame, socket.end() fires as soon as the local close frame ` +
+              `is written, but the kernel still flushes bytes that already reached it; no error ` +
+              `is surfaced to the send callback. Delivery to the peer application is best-effort.`
+          );
+          wss.close(() => {
+            client.terminate();
+            finish();
+          });
+        }
+      }, 30);
+    }
+  );
+
+  wss.on('error', finish);
+}
+
+function scenarioH(finish) {
+  const wss = new WebSocketServer(
+    { port: 0, perMessageDeflate: { threshold: 0 } },
+    () => {
+      const client = new WebSocket(`ws://localhost:${wss.address().port}`, {
+        perMessageDeflate: true
+      });
+
+      let serverWs;
+      let serverDataCb = null;
+      let serverErrorEmitted = false;
+      let serverCloseEmitted = false;
+      let clientCloseEmitted = false;
+      const clientReceived = [];
+
+      wss.on('connection', (ws) => {
+        serverWs = ws;
+        attachProbes(ws, 'SERVER');
+        ws.on('error', (err) => {
+          serverErrorEmitted = true;
+          log('SERVER', `'error' EVENT: ${err.message}`);
+        });
+        ws.on('close', (code) => {
+          serverCloseEmitted = true;
+          log('SERVER', `'close' EVENT code=${code}`);
+        });
+
+        const payload = makeIncompressiblePayload(HUGE_SIZE);
+        log(
+          'SERVER',
+          `send() large compressed snapshot, payloadBytes=${payload.length}`
+        );
+        ws.send(payload, { binary: true }, (err) => {
+          serverDataCb = err ? 'error: ' + err.message : 'ok';
+          log(
+            'SERVER',
+            `data send() CALLBACK: ${serverDataCb}; socketDestroyed=${ws._socket.destroyed}`
+          );
+        });
+
+        log(
+          'SERVER',
+          `send() returned; sender.state=${ws._sender._state}. ` +
+            `PEER will terminate() (RST) while we are still compressing.`
+        );
+
+        setTimeout(() => {
+          log(
+            'CLIENT',
+            'calling terminate() (abrupt reset) while server compresses'
+          );
+          client.terminate();
+        }, 5);
+      });
+
+      client.on('message', (data) => {
+        clientReceived.push(data.length);
+        log('CLIENT', `RECEIVED message bytes=${data.length}`);
+      });
+      client.on('close', (code) => {
+        clientCloseEmitted = true;
+        log('CLIENT', `'close' EVENT code=${code}`);
+      });
+
+      const check = setInterval(() => {
+        if (serverWs && serverCloseEmitted && clientCloseEmitted) {
+          clearInterval(check);
+          log(
+            'RESULT',
+            `peer abrupt terminate() during compression: server data callback=${serverDataCb}; ` +
+              `server error event=${serverErrorEmitted}; client received ${clientReceived.length} ` +
+              `data frame(s). The RST destroys the local socket; the in-flight data may be lost, ` +
+              `and whether the send callback gets an error depends on timing of the OS notification. ` +
+              `This is the case where even "written to local socket" cannot guarantee delivery, and ` +
+              `the close code is abnormal (1006).`
+          );
+          wss.close(() => {
+            client.terminate();
+            finish();
+          });
+        }
+      }, 30);
+    }
+  );
 
   wss.on('error', finish);
 }
@@ -544,6 +821,18 @@ async function main() {
     await runScenario(
       'E: data written to local socket buffer (callback fired) but peer not yet reading - backpressure boundary',
       scenarioE
+    );
+    await runScenario(
+      'F: PEER graceful close() while local data is still compressing (local has NOT called close)',
+      scenarioF
+    );
+    await runScenario(
+      'G: BOTH sides graceful close() simultaneously while local data is still compressing',
+      scenarioG
+    );
+    await runScenario(
+      'H: PEER terminate() (abrupt RST) while local data is still compressing',
+      scenarioH
     );
     console.log('\nAll scenarios completed.');
     process.exit(0);
