@@ -184,6 +184,139 @@ describe('close-during-compression investigation', () => {
     });
   });
 
+  it('flushes queued messages before the close frame on local graceful close', (done) => {
+    const callbacks = [];
+
+    const wss = new WebSocket.Server(
+      { perMessageDeflate: { threshold: 0 }, port: 0 },
+      () => {
+        const ws = new WebSocket(`ws://localhost:${wss.address().port}`);
+        const received = [];
+
+        ws.on('message', (data) => received.push(data));
+
+        ws.on('close', (code) => {
+          assert.strictEqual(code, 1000);
+
+          //
+          // The message being compressed and the one queued behind it are
+          // both delivered, in order, before the close frame.
+          //
+          assert.strictEqual(received.length, 2);
+          assert.deepStrictEqual(received[0], PAYLOAD);
+          assert.deepStrictEqual(received[1], PAYLOAD);
+          assert.deepStrictEqual(callbacks, ['cb1', 'cb2']);
+
+          wss.close(done);
+        });
+      }
+    );
+
+    wss.on('connection', (ws) => {
+      ws.send(PAYLOAD, (err) => {
+        assert.ifError(err);
+        callbacks.push('cb1');
+      });
+      ws.send(PAYLOAD, (err) => {
+        assert.ifError(err);
+        callbacks.push('cb2');
+      });
+
+      // The close frame is queued behind both messages.
+      ws.close(1000);
+    });
+  });
+
+  it('drops the message being compressed and the queued ones on local terminate()', (done) => {
+    const errors = [];
+    let clientReceived = 0;
+
+    const wss = new WebSocket.Server(
+      { perMessageDeflate: { threshold: 0 }, port: 0 },
+      () => {
+        const ws = new WebSocket(`ws://localhost:${wss.address().port}`);
+
+        ws.on('message', () => clientReceived++);
+        ws.on('close', (code) => {
+          // The client only observes an abnormal closure.
+          assert.strictEqual(code, 1006);
+          assert.strictEqual(clientReceived, 0);
+
+          // Both callbacks report the loss.
+          assert.strictEqual(errors.length, 2);
+
+          for (const err of errors) {
+            assert.ok(err instanceof Error);
+            assert.strictEqual(
+              err.message,
+              'The socket was closed while data was being compressed'
+            );
+          }
+
+          wss.close(done);
+        });
+      }
+    );
+
+    wss.on('connection', (ws) => {
+      ws.send(PAYLOAD, (err) => errors.push(err));
+      ws.send(PAYLOAD, (err) => errors.push(err));
+
+      //
+      // Destroys the socket synchronously, while the first message is still
+      // being compressed and the second is queued.
+      //
+      ws.terminate();
+    });
+  });
+
+  it('does not truncate queued messages when the peer closes during compression', (done) => {
+    const received = [];
+    const callbacks = [];
+
+    const wss = new WebSocket.Server(
+      { perMessageDeflate: { threshold: 0 }, port: 0 },
+      () => {
+        const ws = new WebSocket(`ws://localhost:${wss.address().port}`);
+
+        ws.on('open', () => {
+          //
+          // The close frame reaches the server while the first message is
+          // still being compressed and the second is queued.
+          //
+          ws.close(1000);
+        });
+
+        ws.on('message', (data) => received.push(data));
+
+        ws.on('close', (code) => {
+          //
+          // The peer initiated the handshake yet still receives both
+          // messages, in order, before it completes.
+          //
+          assert.strictEqual(code, 1000);
+          assert.strictEqual(received.length, 2);
+          assert.deepStrictEqual(received[0], PAYLOAD);
+          assert.deepStrictEqual(received[1], PAYLOAD);
+          assert.deepStrictEqual(callbacks, ['cb1', 'cb2']);
+
+          wss.close(done);
+        });
+      }
+    );
+
+    wss.on('connection', (ws) => {
+      ws.send(PAYLOAD, (err) => {
+        assert.ifError(err);
+        callbacks.push('cb1');
+      });
+      ws.send(PAYLOAD, (err) => {
+        assert.ifError(err);
+        callbacks.push('cb2');
+      });
+    });
+  });
+
   it('runs the send callback before the peer has necessarily processed the message', (done) => {
     let client;
     let messageReceived = false;
