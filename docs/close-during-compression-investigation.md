@@ -198,7 +198,15 @@ MiB 不可压缩负载（`crypto.randomBytes`）把 deflate 窗口拉宽到数�
    `terminate()`（对照组，非优雅关闭）**：本端在压缩消息和排队消息的两个回调都收到
    `The socket was closed while data was being compressed`，`'close'`
    码 1006，对端什么都没收到。证实边界 B 的丢失信号，以及与优雅关闭的区别。
-5. **回调成功 ≠ 对端已处理**：对端 `pause()` 期间，本端 `send()`
+5. **本地优雅关闭 + 排队消息**：`send(A); send(B); close(1000)`
+   连续调用后，对端按序收到 A、B 再收到 close（1000）；两个回调按发送顺序成功。证实排队消息在优雅关闭下不丢失、不越过 close 帧。
+6. **本地 `terminate()` + 排队消息**：`terminate()`
+   同步销毁 socket 后，在途压缩消息与排队消息的两个回调都报
+   `The socket was closed while data was being compressed`；对端零消息，双方
+   `'close'` 码 1006。与场景 5 构成同一调用序列的两种结局。
+7. **对端在压缩中开始关闭 + 排队消息**：对端 `'open'` 后立即 `close(1000)`，本端
+   `send(A); send(B)`。发起关闭的一方仍按序收到 A、B，握手以 1000 完成；本端两个回调成功，回显的 close 帧排在 B 之后。证实对端发起关闭不会截断本端发送队列。
+8. **回调成功 ≠ 对端已处理**：对端 `pause()` 期间，本端 `send()`
    回调成功、close 帧已发出，但对端尚未触发 `'message'`；`resume()`
    后才按“消息 → close（1000）”完成。量化边界 B 之后的距离。
 
@@ -224,3 +232,94 @@ npx mocha --throw-deprecation test/close-during-compression.test.js
 - `closeTimeout`
   兜底销毁会把优雅关闭退化为场景 4/6 的结果：大快照压缩慢、对端响应慢时，30 秒窗口内握手不完就会触发，现场可用
   `'close'` 码 1006 + 上述回调错误识别。
+
+## 发布评审结论
+
+### 协商默认行为：客户端与服务端并不对称
+
+- **服务端 `WebSocketServer`：默认不启用压缩**。`perMessageDeflate` 默认
+  `false`（`lib/websocket-server.js:76`），此时即使客户端发来offer，服务端也不会实例化扩展、不会
+  `accept()`（`lib/websocket-server.js:299-313`），连接全程不压缩。**是否压缩由服务端单方面决定**。
+- **客户端 `WebSocket`：默认发起 offer**。`perMessageDeflate` 默认
+  `true`（`lib/websocket.js:677`），但只能接受服务端回包的参数（`lib/websocket.js:1018-1026`），不能单方面强制压缩。
+- **调用侧无法从 `send()` 感知协商结果**：`compress`
+  选项默认true，但扩展未协商成功时被静默改为false（`lib/websocket.js:480-482`）。协商参数（窗口大小、context
+  takeover）在 upgrade 时定死，连接期间不可变更。
+
+### 影响资源与排队表现的配置
+
+| 配置                                                  | 默认值                  | 对资源 / 排队的影响                                                                                                                                                                               | 出处                                                                                      |
+| ----------------------------------------------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `concurrencyLimit`                                    | 10                      | 进程级全局 `zlibLimiter` 并发；**只在第一个 `PerMessageDeflate` 实例创建时读取，之后的配置静默失效**。高扇出下所有连接的压缩与解压共享它，队首阻塞会同步拉长每条连接的压缩窗口与 close 帧排队时间 | `lib/permessage-deflate.js:65-71`                                                         |
+| `threshold`                                           | 1024                    | **仅在协商了对应方向的 no_context_takeover 时才生效**；默认协商（context takeover 开启）下被忽略，所有消息一律压缩。想让小消息跳过压缩必须同时配置 no_context_takeover                            | `lib/sender.js:371-384`、`lib/permessage-deflate.js:56-57`                                |
+| `serverMaxWindowBits` / `clientMaxWindowBits`         | 未设置（zlib 默认 15）  | 每连接 deflate/inflate 流内存随窗口指数增长，是高扇出下的主要内存乘数；流首次使用时创建，`'close'` 时由 `cleanup()` 释放                                                                          | `lib/permessage-deflate.js:404-417`、`130-150`                                            |
+| `serverNoContextTakeover` / `clientNoContextTakeover` | false                   | 每条消息 fin 后 reset 流：放弃跨消息字典（压缩率下降），换取无跨消息状态，并解锁 `threshold` 门                                                                                                   | `lib/permessage-deflate.js:454-456`                                                       |
+| `zlibDeflateOptions` / `zlibInflateOptions`           | 无                      | 透传 zlib（level、memLevel 等），直接决定单次压缩的 CPU / 内存                                                                                                                                    | `lib/permessage-deflate.js:414-417`                                                       |
+| `maxPayload`                                          | 100 MiB（双端默认相同） | 解压侧超限即 RangeError（1009）并触发关闭，是接收方向资源的上限保险                                                                                                                               | `lib/websocket.js:675`、`lib/websocket-server.js:74`、`lib/permessage-deflate.js:485-506` |
+| `closeTimeout`                                        | 30 s                    | 优雅关闭的兜底；压缩慢或对端响应慢导致窗口耗尽时关闭退化为 `destroy()`，在途与排队消息按场景 4/6 的方式丢失                                                                                       | `lib/constants.js:10`、`lib/websocket.js:1309-1314`                                       |
+
+### 只能说明本机进度、不能代表交付完成的信号
+
+- `send()` 不抛错地返回：仅通过 `readyState`
+  检查（边界 A），消息可能还在 zlib 线程池。
+- `send()` 回调成功：边界 B，已写入本地 socket。
+- `bufferedAmount`：本地账本，且会被被拒收的消息虚增（`lib/websocket.js:1148`），连“待发出”都不准确。
+- `'close'` 事件及事件码：只描述握手结局；1006 不区分 `terminate()`、断网与
+  `closeTimeout` 兜底。
+- 台账与监控可观察的指标（仍全部属于本机进度）：按回调错误消息分类计数（两类错误含义见“结论速查”）；`send()`
+  → 回调的时延分布（约等于压缩 + 全局限流排队窗口）；`close()` → `'close'`
+  的时延（逼近 `closeTimeout` 是降级前兆）；1006 占比。
+
+### 最终建议：高扇出是否继续启用压缩
+
+按瓶颈决策，不建议一刀切：
+
+- **带宽是瓶颈、快照大且可压缩**：继续启用，但建议同时——
+  1. 协商双方向 `no_context_takeover` 并设置 `threshold`，让小消息跳过压缩；
+  2. 用 `serverMaxWindowBits` 把每连接内存压到可接受水位；
+  3. 按 CPU 核数评估 `concurrencyLimit`，并在进程中最先创建 `PerMessageDeflate`
+     的位置设置（首实例生效陷阱）；
+  4. 监控 close 握手时延，逼近 `closeTimeout` 时告警——这是高峰期消息丢失的前兆。
+- **CPU 是瓶颈，或关闭时延 SLO 严格**：服务端不启用压缩（默认即如此）。客户端的默认 offer 不会造成压缩，协商结果就是“不压缩”，协议语义不变，同时消除了本文档全部“压缩窗口”类风险（关闭时 close 帧立即发出）。
+- **无论是否启用**：台账以 `send()`
+  回调为唯一记账时点；“对端已送达”只能由应用层确认帧产生。本调查不提供、评审也不应要求用库层信号伪造该语义。
+
+### 剩余风险
+
+1. 回调成功之后连接再 1006：消息是否到达对端不可判定（边界 B 之后没有任何信号）。
+2. `closeTimeout` 兜底、对端 `terminate()`
+   与网络故障在观察侧不可区分（同为 1006 + 同类回调错误）。
+3. 全局 `zlibLimiter`
+   的队首阻塞在高扇出高峰期同时拉长压缩窗口与 close 帧时延，正是场景 4/6 的温床。
+4. 配置陷阱：`threshold` 在无 `no_context_takeover`
+   时静默失效；`concurrencyLimit` 仅首实例生效。
+5. 排队中的消息没有独立状态，队首压缩失败会整队牵连（`callCallbacks()`）。
+6. 本调查的观察基于本仓库双端实现对 localhost 的复现；与其他实现（如浏览器客户端）交互时，“对端先关仍收到在途消息”依赖对端在关闭期间继续读取，未在本次复现范围内。
+
+### 证据索引
+
+| 结论                                          | 源码依据                                                        | 本地证据（场景）                     |
+| --------------------------------------------- | --------------------------------------------------------------- | ------------------------------------ |
+| 优雅关闭下在途与排队消息先于 close 帧发出     | `lib/sender.js:224-225`、`536-543`                              | 1、5、7                              |
+| `close()` 后 `send()` 被拒绝、不进入发送层    | `lib/websocket.js:467-469`、`1138-1159`                         | 2                                    |
+| socket 销毁时在途与排队消息整队丢失、回调报错 | `lib/sender.js:514-521`、`585-594`                              | 4、6                                 |
+| 发起关闭的一方仍收到在途消息                  | `lib/websocket.js:1168-1182`（conclude 前 `Receiver` 持续解析） | 3、7                                 |
+| 回调成功不代表对端已处理                      | `lib/sender.js:563-572`（write 回调语义）                       | 8                                    |
+| 异常关闭恒为 1006                             | `lib/websocket.js:58`、`1168-1173`                              | 4、6                                 |
+| 服务端默认不压缩、客户端默认 offer            | `lib/websocket-server.js:76`、`lib/websocket.js:677`            | 全部场景均需显式开启服务端压缩才成立 |
+| `threshold` 需 no_context_takeover 才生效     | `lib/sender.js:371-384`                                         | ——（代码审查结论，未单独复现）       |
+| `concurrencyLimit` 全局且首实例生效           | `lib/permessage-deflate.js:65-71`                               | ——（代码审查结论，未单独复现）       |
+
+补充精度：对端 conclude 之后会移除 socket 的 `'data'`
+监听（`lib/websocket.js:1177`），在 close帧之后到达的数据帧会被忽略——因此“先于 close 帧发出”是精确条件，而非保守说法。
+
+### 一致性复查记录
+
+- 场景编号与 `test/close-during-compression.test.js`
+  的执行顺序一一对应（1–8）。复查中发现文档场景列表曾被回退为 5 项、与正文引用（场景 5/6/7/8）矛盾，已修正回 8 项。
+- “三种关闭时序的对比”与“投递台账口径”两张表的每一行均有场景断言支撑（见证据索引）。
+- 协商默认值、`threshold` 生效条件、`concurrencyLimit`
+  生效时机等代码审查结论与复现场景不冲突：场景全部显式启用服务端压缩并使用
+  `threshold: 0`；默认协商（context takeover 开启）下 `threshold`
+  本就不生效，写 0 仅为显式声明意图，不影响任何断言。
+- 除上述已修正项外，未发现实验观察与源码解释相互矛盾的残留项。
