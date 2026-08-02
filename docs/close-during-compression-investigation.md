@@ -430,7 +430,136 @@ RESULT: server data callback=error; server error event=false; client received 0 
 
 ---
 
-## 6. 涉及的关键代码位置
+## 6. 发布评审结论（高扇出网关：压缩开关、台账、监控）
+
+本节把前两轮已验证的发送边界与关闭/压缩时序收敛成可直接评审的决策依据。所有结论都只基于现有实现，不修改库、不包装 API、不伪造确认。
+
+### 6.1 客户端与服务端的默认协商行为
+
+压缩是否生效取决于**两端都开启**并通过 HTTP 握手协商，任一端关闭即不压缩：
+
+| 角色 | 配置项 | 默认值 | 行为 |
+|------|--------|--------|------|
+| 客户端 | `perMessageDeflate` | `true`（[initAsClient](file:///e:/newGsb/questions/GSB-005/Tony/lib/websocket.js#L667-L689)） | 默认在握手头里带 `permessage-deflate` 要约（[websocket.js#L769-L778](file:///e:/newGsb/questions/GSB-005/Tony/lib/websocket.js#L769-L778)） |
+| 服务端 | `perMessageDeflate` | `false`（[WebSocketServer](file:///e:/newGsb/questions/GSB-005/Tony/lib/websocket-server.js#L69-L89)） | **默认不接受压缩**；只有显式传 `true` 或配置对象才会解析并接受客户端要约（[websocket-server.js#L298-L321](file:///e:/newGsb/questions/GSB-005/Tony/lib/websocket-server.js#L298-L321)） |
+
+含义：
+
+- 只有当服务端显式启用（如 `new WebSocketServer({ perMessageDeflate: true })`）时，连接才会协商出 `permessage-deflate`。本调查的所有压缩场景都据此配置。
+- 协商成功后，`ws.extensions` 字符串包含 `permessage-deflate`；否则 `send()` 的 `compress` 选项被强制置 `false`（[websocket.js#L480-L484](file:///e:/newGsb/questions/GSB-005/Tony/lib/websocket.js#L480-L484)），消息明文发送。
+- **监控/台账上线前应先确认线上服务端确实启用了压缩**，否则"压缩大快照"这一前提不成立，第 4 节里压缩带来的异步延迟窗口也不会出现。
+
+### 6.2 影响资源与排队表现的配置
+
+| 配置 | 默认值 | 对资源/排队的影响 | 高扇出注意事项 |
+|------|--------|------------------|----------------|
+| `perMessageDeflate.concurrencyLimit` | `10`（[permessage-deflate.js#L65-L71](file:///e:/newGsb/questions/GSB-005/Tony/lib/permessage-deflate.js#L65-L71)） | **进程级全局** zlib 任务并发上限（`zlibLimiter` 是单例，跨所有连接共享），限制同时跑在 libuv 线程池上的压缩/解压任务数 | 高扇出下，N 个连接的大快照压缩会在这个全局队列里排队；超过 10 的任务等待，直接放大场景 B/F/G 里"压缩中"的时间窗口。这是 CPU/内存与排队延迟的主要来源 |
+| `perMessageDeflate.threshold` | `1024` | 仅在对应方向 `no_context_takeover` 生效时，小于该字节的消息不压缩（[sender.js#L371-L385](file:///e:/newGsb/questions/GSB-005/Tony/lib/sender.js#L371-L385)） | 默认协商**不**带 `no_context_takeover`，因此该阈值默认不拦压缩；不要误以为"小消息不压缩" |
+| `server/client_no_context_takeover` | 未设置（即允许上下文接管） | 开启后每条消息重置 deflate/inflate 上下文，压缩率略降但释放历史缓冲 | 影响内存占用与压缩率，不改变关闭/排队语义 |
+| `zlibDeflateOptions` / `zlibInflateOptions` | 未设置 | 透传给 `zlib.createDeflateRaw/InflateRaw`，含 `level`/`memLevel`/`chunkSize` 等 | 可调压缩等级与内存；压缩等级越高，CPU 时间越长，异步窗口越大 |
+| `closeTimeout` | `30000`（[constants.js#L10](file:///e:/newGsb/questions/GSB-005/Tony/lib/constants.js#L10)） | 优雅关闭后等对端回 close 的超时，到时 `socket.destroy()` | 对端不响应时，已写内核但未确认的数据最长挂 30s 后可能被丢弃 |
+| `maxPayload` | 客户端 100 MiB，服务端 100 MiB | 接收端解压后消息大小上限，超限以 1009 关闭（[receiver.js#L439-L457](file:///e:/newGsb/questions/GSB-005/Tony/lib/receiver.js#L439-L457)、[permessage-deflate.js#L485-L506](file:///e:/newGsb/questions/GSB-005/Tony/lib/permessage-deflate.js#L485-L506)） | 防止单个大快照解压耗尽接收端内存；与发送端排队无关 |
+| `maxBufferedChunks` / `maxFragments` | 262144 块 / 16384 片（客户端，[websocket.js#L673-L675](file:///e:/newGsb/questions/GSB-005/Tony/lib/websocket.js#L673-L675)），262144 块 / 16384 片（服务端，[websocket-server.js#L72-L74](file:///e:/newGsb/questions/GSB-005/Tony/lib/websocket-server.js#L72-L74)） | 接收端缓冲块/分片数量上限，超限报错关闭 | 接收侧背压保护（计的是块数不是字节数），不影响发送队列 |
+| `highWaterMark`（底层 socket，由 Node/net 决定） | net.Socket 默认 16 KiB（可通过自定义 `createConnection` 调整） | 决定 `socket.write` 何时返回 false 产生背压，以及 `_writableState.length` 的规模 | 慢消费者时 Node 侧写缓冲增长程度；内核发送/接收缓冲另由 OS 控制 |
+
+资源语义要点：
+
+1. **压缩/解压共享全局并发**：`zlibLimiter` 不是每个连接一个，而是进程内所有 `PerMessageDeflate` 实例共享（[permessage-deflate.js#L24](file:///e:/newGsb/questions/GSB-005/Tony/lib/permessage-deflate.js#L24) 注释明确是为避免全局线程池内存碎片）。高扇出+大快照时，压缩排队是全局性的，单连接的大消息会拖慢其他连接的压缩。注意：该限流器在**首个** `PerMessageDeflate` 实例构造时按其 `concurrencyLimit` 懒初始化（[permessage-deflate.js#L65-L71](file:///e:/newGsb/questions/GSB-005/Tony/lib/permessage-deflate.js#L65-L71)），之后的实例不会重置它；因此不同连接若传了不同的 `concurrencyLimit`，实际生效的是进程里第一个实例的值。评审配置时应全进程统一设置。
+2. **发送队列在每个连接的 Sender 内**：`_queue`/`_bufferedBytes` 是每连接的（[sender.js#L51-L53](file:///e:/newGsb/questions/GSB-005/Tony/lib/sender.js#L51-L53)），但 `_bufferedBytes` 计的是**未压缩**字节数。压缩完成前，`bufferedAmount` 反映原始大小；压缩后才组帧写 socket。
+3. **关闭不取消压缩任务**：无论本地还是对端优雅关闭，已经进入 zlib 的任务会跑完（场景 A/B/D/F/G 均观察到压缩继续并最终发送）。
+
+### 6.3 只能说明本机进度、不能代表交付完成的信号
+
+| 信号 | 能说明的本机进度 | 绝不能据此认定的事 |
+|------|------------------|--------------------|
+| `ws.send()` 正常返回 | 边界①：发送层已接收，任务进入压缩或队列 | 不能认定已发送、更不能认定对端收到 |
+| `send(data, cb)` 回调 `err===null` | 边界②：帧已 `socket.write`、字节交给本机内核 | **不能认定对端收到/处理**（场景 E 实测回调后 200ms 对端才 message；F/G 回调成功也不构成跨机器保证） |
+| `ws.bufferedAmount` 下降或归零 | 本机 Sender 队列/socket 写缓冲已排空 | 不代表对端已读；它混合 socket 与 Sender 两种口径（[websocket.js#L120-L124](file:///e:/newGsb/questions/GSB-005/Tony/lib/websocket.js#L120-L124)） |
+| 本端 `'close'` 事件触发（code≠1006） | 本端关闭握手完成、socket 已关闭 | 不代表之前发的业务消息被对端应用处理 |
+| `closeFrameSent=true` | close 帧已写入本机 socket | 只代表关闭帧离开本机，不代表数据帧被对端消费 |
+| socket 的 `'finish'`/`end` 事件 | 本机写侧已冲刷完毕 | 仍是本机信号，不保证对端应用收到 |
+| 对端 TCP ACK（内核层，应用不可见） | 字节到达对端内核 | 不代表对端 WebSocket 解析完成或业务处理 |
+
+**唯一能代表"交付完成"的信号是应用层 ACK**：对端业务处理完该快照后回一条带消息 id 的确认。这不在 ws 库职责内，需要网关协议自行定义；本调查不提供也不建议伪造该确认。
+
+### 6.4 是否继续启用压缩（决策建议）
+
+以下建议基于本仓库行为，供负责人结合业务数据拍板，不是对库的修改要求：
+
+**建议：按连接/消息类型有条件启用，而非在高扇出网关上全局无条件启用。**
+
+适用条件（启用压缩收益明确）：
+
+- 出向消息**可压缩率高**（如结构化行情快照、JSON、重复字段多），带宽成本是瓶颈。
+- 单连接消息量大、扇出数可控，或大快照不频繁。
+- 能接受压缩带来的异步窗口（场景 B：16 MiB 不可压缩数据压缩耗时数百毫秒），并已用应用层 ACK 兜底交付确认。
+
+不建议启用 / 应关闭压缩的情形：
+
+- 消息本身**已压缩或近随机**（如 protobuf+gzip、加密后二进制、图像）。压缩耗时和 CPU 开销几乎不减小体积（场景 B/H 中 16 MiB 随机数据压到 16.78 MiB，几乎无收益却占用全局 zlib 配额）。
+- **超高扇出 + 大快照广播**：全局 zlibLimiter（并发 10）会成为所有连接共享的瓶颈，放大关闭/压缩重叠窗口和内存占用（`_bufferedBytes` 持有的是未压缩原始数据）。
+- 对关闭时序敏感、要求"发完即确定送达"的场景——但注意：即便关闭压缩也无法提供对端送达保证，这必须靠应用层 ACK，而非关压缩解决。
+
+落地手段（都是公开配置，不碰 `lib/`）：
+
+- 服务端按业务决定 `perMessageDeflate: true | false | { ... }`。
+- 对需要压缩的连接用 `perMessageDeflate: { threshold, concurrencyLimit, zlibDeflateOptions: { level } }` 调优；`concurrencyLimit` 是进程级，按机器 CPU 核数与扇出规模评估。
+- 对单条消息可用 `ws.send(data, { compress: false })` 对不可压缩/低价值消息明文发送（扩展已协商时仍可逐消息关闭压缩）。
+- 无论是否压缩，关键快照都带应用层 ACK 与消息 id。
+
+### 6.5 台账与监控应该观察什么
+
+台账状态机（与 3.1 一致，评审口径）：
+
+```
+send() 返回
+  └─[本机已接收]─→ send 回调无错
+                     └─[本机已发出]─→ 应用层 ACK
+                                        └─[对端已送达]
+send 回调有错 / close(1006) / socket error
+  └─[发送失败/未确认]（需对账或重发）
+```
+
+监控指标建议（均可通过公开属性/事件获取，不包装内部 API）：
+
+- `ws.bufferedAmount`：本机待发字节趋势，用于背压告警。注意它是未压缩口径与 socket 口径之和，只作本机进度参考。
+- `send` 回调错误率，区分错误类型：
+  - `"The socket was closed while data was being compressed"`（压缩期间被关闭/重置，场景 C/H 实测）。
+  - `"WebSocket is not open: readyState 2/3 (CLOSING/CLOSED)"`（在 `close()` 之后才调用 `send()`，由 [sendAfterClose](file:///e:/newGsb/questions/GSB-005/Tony/lib/websocket.js#L1138-L1159) 在下个 tick 回调；这是接入代码时序 bug 的信号）。
+  - `ECONNRESET`/`EPIPE`（对端异常，可能已过边界②才报错）。
+- `'close'` 事件的 code：1006 表示异常关闭，对应连接上"本机已发出但未确认"的消息应全部回退为未确认。
+- `'error'` 事件计数。
+- 应用层 ACK 延迟与未确认数：这才是交付质量指标。
+- 进程级 zlib 排队无法直接从公开 API 读取，但可通过"send() 返回 → 回调无错"的耗时分布（即边界①到②的延迟）间接观测压缩+全局排队耗时。
+
+### 6.6 剩余风险（现有实现无法消除，评审须知）
+
+1. **无单条消息送达确认**：WebSocket/TCP 不向应用暴露"对端已处理"。回调成功只到边界②，这是设计事实，不是缺陷。
+2. **边界②到③之间的丢失窗口**：回调成功后到对端 message 之前，若发生 RST、进程崩溃、机器掉电，数据可能丢失（场景 E 演示了时间差，场景 H 演示了 RST）。
+3. **全局 zlib 并发瓶颈**：高扇出下压缩任务在进程级队列排队，单连接大快照影响全局，且压缩中持有未压缩原始数据，内存峰值与扇出×消息大小相关。
+4. **优雅关闭不等于全部送达**：`close()` 保证数据帧先于 close 帧离开本机、内核会冲刷，但不保证对端应用在关闭前处理；`closeTimeout`（默认 30s）到时强制 destroy 也可能丢弃在途数据。
+5. **平台/时序差异**：RST 是否反映为 `'error'` 事件、回调是否收到 `ECONNRESET`，随操作系统与 Node 版本不同（场景 H 在 Windows+Node 22 上只触发 close(1006)，未额外 emit error）。台账不应依赖某个特定错误文案/事件组合。
+6. **对端先优雅关闭时的数据投递依赖字节序**：场景 F/G 在本机回环中对端收到了数据，但跨机器高延迟下，若对端 close 先于数据帧到达对端内核，receiver 会丢弃 close 之后的字节（[receiver.js#L97](file:///e:/newGsb/questions/GSB-005/Tony/lib/receiver.js#L97)）。这属于 TCP 字节序与对端读取时机，本库不保证、也无法保证业务消息一定先到。
+
+### 6.7 本地证据索引
+
+| 结论 | 证据 |
+|------|------|
+| 优雅 close 排队、不丢在压数据 | 场景 A/B/D；[sender.close()](file:///e:/newGsb/questions/GSB-005/Tony/lib/sender.js#L224-L228)、[dispatch→enqueue](file:///e:/newGsb/questions/GSB-005/Tony/lib/sender.js#L409-L413) |
+| 压缩是异步的，send 返回时可能仍在 DEFLATING | 场景 B（300ms 仍 state=1）；[dispatch](file:///e:/newGsb/questions/GSB-005/Tony/lib/sender.js#L511-L528)、[compress](file:///e:/newGsb/questions/GSB-005/Tony/lib/permessage-deflate.js#L322-L329) |
+| terminate 中断压缩、回调报错、数据不发 | 场景 C/H；[websocket.terminate()](file:///e:/newGsb/questions/GSB-005/Tony/lib/websocket.js#L500-L503)、[dispatch destroyed 检测](file:///e:/newGsb/questions/GSB-005/Tony/lib/sender.js#L514-L521) |
+| 回调成功 ≠ 对端收到（边界②③差距） | 场景 E（回调后 200ms 才 message）；[sendFrame](file:///e:/newGsb/questions/GSB-005/Tony/lib/sender.js#L563-L572) |
+| 对端优雅 close 不丢弃本地在压数据 | 场景 F/G；[receiverOnConclude](file:///e:/newGsb/questions/GSB-005/Tony/lib/websocket.js#L1168-L1182)、[receiver _write 丢弃规则](file:///e:/newGsb/questions/GSB-005/Tony/lib/receiver.js#L96-L98) |
+| 对端 RST 导致异常关闭、可能丢消息 | 场景 H（双方 1006，回调报错）；[socketOnClose](file:///e:/newGsb/questions/GSB-005/Tony/lib/websocket.js#L1321-L1365) |
+| close 后再 send 立即报错 | [sendAfterClose](file:///e:/newGsb/questions/GSB-005/Tony/lib/websocket.js#L1138-L1159) |
+| 全局 zlib 并发限制 | [permessage-deflate.js#L24](file:///e:/newGsb/questions/GSB-005/Tony/lib/permessage-deflate.js#L24)、[L65-L71](file:///e:/newGsb/questions/GSB-005/Tony/lib/permessage-deflate.js#L65-L71)、[limiter.js](file:///e:/newGsb/questions/GSB-005/Tony/lib/limiter.js) |
+| 服务端默认不压缩、客户端默认要约压缩 | [websocket-server.js#L76](file:///e:/newGsb/questions/GSB-005/Tony/lib/websocket-server.js#L69-L89)、[websocket.js#L677](file:///e:/newGsb/questions/GSB-005/Tony/lib/websocket.js#L667-L689) |
+
+复现命令：`node test/close-during-compression-repro.js`（8 个场景，零新依赖，不修改 `lib/`）。
+
+---
+
+## 7. 涉及的关键代码位置
 
 - 发送入口与压缩开关：[websocket.js send()](file:///e:/newGsb/questions/GSB-005/Tony/lib/websocket.js#L455-L485)
 - 优雅关闭：[websocket.js close()](file:///e:/newGsb/questions/GSB-005/Tony/lib/websocket.js#L302-L340)
