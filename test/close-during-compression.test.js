@@ -433,3 +433,404 @@ describe('close during compression investigation', () => {
     }
   );
 });
+
+describe('close timing outcome matrix for delivery ledger', () => {
+  it(
+    'timing 1 - local graceful close: compressing message and queued ' +
+      'messages all succeed, close code 1000',
+    (done) => {
+      const results = {
+        msgCompressing: { cb: false, err: null },
+        msgQueued1: { cb: false, err: null },
+        msgQueued2: { cb: false, err: null },
+        cbOrder: []
+      };
+
+      const wss = new WebSocket.Server(
+        { perMessageDeflate: true, port: 0 },
+        () => {
+          const ws = new WebSocket(`ws://localhost:${wss.address().port}`, {
+            perMessageDeflate: { threshold: 0 }
+          });
+
+          ws.on('open', () => {
+            ws.send(
+              makeLargeSnapshot(64 * 1024),
+              { compress: true, binary: true },
+              (err) => {
+                results.msgCompressing.cb = true;
+                results.msgCompressing.err = err;
+                results.cbOrder.push('compressing');
+              }
+            );
+            ws.send(
+              Buffer.from('queued-1-' + 'x'.repeat(4096)),
+              { compress: true, binary: true },
+              (err) => {
+                results.msgQueued1.cb = true;
+                results.msgQueued1.err = err;
+                results.cbOrder.push('queued1');
+              }
+            );
+            ws.send(
+              Buffer.from('queued-2-' + 'y'.repeat(4096)),
+              { compress: true, binary: true },
+              (err) => {
+                results.msgQueued2.cb = true;
+                results.msgQueued2.err = err;
+                results.cbOrder.push('queued2');
+              }
+            );
+
+            assert.strictEqual(ws._sender._state, DEFLATING);
+            assert.strictEqual(ws._sender._queue.length, 2);
+
+            ws.close(1000);
+            assert.strictEqual(ws._sender._queue.length, 3);
+          });
+
+          ws.on('close', (code) => {
+            assert.strictEqual(results.msgCompressing.err, null);
+            assert.strictEqual(results.msgQueued1.err, null);
+            assert.strictEqual(results.msgQueued2.err, null);
+            assert.deepStrictEqual(results.cbOrder, [
+              'compressing',
+              'queued1',
+              'queued2'
+            ]);
+            assert.strictEqual(code, 1000);
+            wss.close(done);
+          });
+        }
+      );
+
+      wss.on('connection', (ws) => {
+        const received = [];
+        ws.on('message', (data) => received.push(data));
+        ws.on('close', (code) => {
+          assert.strictEqual(received.length, 3);
+          assert.strictEqual(received[0].length, 64 * 1024);
+          assert.strictEqual(code, 1000);
+        });
+      });
+    }
+  );
+
+  it(
+    'timing 2 - local terminate during compression: compressing and ' +
+      'queued messages all fail, close code 1006, nothing delivered',
+    (done) => {
+      const results = {
+        msgCompressing: { cb: false, err: null },
+        msgQueued: { cb: false, err: null }
+      };
+
+      const wss = new WebSocket.Server(
+        { perMessageDeflate: { threshold: 0 }, port: 0 },
+        () => {
+          const ws = new WebSocket(`ws://localhost:${wss.address().port}`, {
+            perMessageDeflate: { threshold: 0 }
+          });
+
+          ws.on('open', () => {
+            ws.send(
+              makeLargeSnapshot(64 * 1024),
+              { compress: true, binary: true },
+              (err) => {
+                results.msgCompressing.cb = true;
+                results.msgCompressing.err = err;
+              }
+            );
+            ws.send(
+              Buffer.from('queued-' + 'x'.repeat(4096)),
+              { compress: true, binary: true },
+              (err) => {
+                results.msgQueued.cb = true;
+                results.msgQueued.err = err;
+              }
+            );
+
+            assert.strictEqual(ws._sender._state, DEFLATING);
+            ws.terminate();
+          });
+
+          ws.on('close', (code) => {
+            assert.strictEqual(code, 1006);
+            assert.ok(results.msgCompressing.cb);
+            assert.ok(results.msgQueued.cb);
+            assert.ok(results.msgCompressing.err instanceof Error);
+            assert.ok(results.msgQueued.err instanceof Error);
+
+            const validErrors = [
+              'The socket was closed while data was being compressed',
+              'The deflate stream was closed while data was being processed'
+            ];
+            assert.ok(validErrors.includes(results.msgCompressing.err.message));
+            assert.ok(validErrors.includes(results.msgQueued.err.message));
+
+            wss.close(done);
+          });
+        }
+      );
+
+      wss.on('connection', (ws) => {
+        let receivedAny = false;
+        ws.on('message', () => {
+          receivedAny = true;
+        });
+        ws.on('close', (code) => {
+          assert.strictEqual(receivedAny, false);
+          assert.strictEqual(code, 1006);
+        });
+      });
+    }
+  );
+
+  it(
+    'timing 3 - peer closes while we are compressing: outbound compressed ' +
+      'data still flushes, callback succeeds, close code is peer code',
+    (done) => {
+      const results = { sendErr: 'not-called', concludeState: null };
+
+      const wss = new WebSocket.Server(
+        { perMessageDeflate: true, port: 0 },
+        () => {
+          const ws = new WebSocket(`ws://localhost:${wss.address().port}`, {
+            perMessageDeflate: { threshold: 0 }
+          });
+
+          ws.on('open', () => {
+            ws._receiver.on('conclude', () => {
+              results.concludeState = ws._sender._state;
+            });
+
+            ws.send(
+              makeLargeSnapshot(64 * 1024),
+              { compress: true, binary: true },
+              (err) => {
+                results.sendErr = err;
+              }
+            );
+          });
+
+          ws.on('close', (code) => {
+            assert.strictEqual(results.sendErr, null);
+            assert.strictEqual(results.concludeState, DEFLATING);
+            assert.strictEqual(code, 1000);
+            wss.close(done);
+          });
+        }
+      );
+
+      wss.on('connection', (ws) => {
+        const received = [];
+        ws.on('message', (data) => received.push(data));
+        ws.on('close', (code) => {
+          assert.strictEqual(received.length, 1);
+          assert.strictEqual(received[0].length, 64 * 1024);
+          assert.strictEqual(code, 1000);
+        });
+        ws.close(1000);
+      });
+    }
+  );
+
+  it(
+    'callback success at boundary B does not survive a subsequent ' +
+      'terminate: callback has no error but close code is 1006',
+    (done) => {
+      const results = { sendErr: 'not-called' };
+
+      const wss = new WebSocket.Server(
+        { perMessageDeflate: true, port: 0 },
+        () => {
+          const ws = new WebSocket(`ws://localhost:${wss.address().port}`, {
+            perMessageDeflate: { threshold: 0 }
+          });
+
+          ws.on('open', () => {
+            ws.send(
+              Buffer.from('important-payload-' + 'z'.repeat(8192)),
+              { compress: true, binary: true },
+              (err) => {
+                results.sendErr = err;
+                ws.terminate();
+              }
+            );
+          });
+
+          ws.on('close', (code) => {
+            assert.strictEqual(results.sendErr, null);
+            assert.strictEqual(code, 1006);
+            wss.close(done);
+          });
+        }
+      );
+
+      wss.on('connection', (ws) => {
+        ws.on('message', () => {});
+        ws.on('close', () => {});
+      });
+    }
+  );
+
+  it(
+    'send() after close() is rejected at WebSocket layer: never reaches ' +
+      'Sender queue, callback errors next tick',
+    (done) => {
+      const results = { lateErr: null, lateCbCalled: false };
+
+      const wss = new WebSocket.Server(
+        { perMessageDeflate: true, port: 0 },
+        () => {
+          const ws = new WebSocket(`ws://localhost:${wss.address().port}`, {
+            perMessageDeflate: { threshold: 0 }
+          });
+
+          ws.on('open', () => {
+            ws.send(
+              makeLargeSnapshot(32 * 1024),
+              { compress: true, binary: true },
+              () => {}
+            );
+            ws.close(1000);
+
+            const queueBefore = ws._sender._queue.length;
+
+            ws.send('rejected-data', (err) => {
+              results.lateCbCalled = true;
+              results.lateErr = err;
+            });
+
+            assert.strictEqual(
+              ws._sender._queue.length,
+              queueBefore,
+              'rejected send does not enter Sender queue'
+            );
+          });
+
+          ws.on('close', () => {
+            assert.strictEqual(results.lateCbCalled, true);
+            assert.ok(results.lateErr instanceof Error);
+            assert.ok(
+              results.lateErr.message.includes(
+                'WebSocket is not open: readyState 2'
+              )
+            );
+            wss.close(done);
+          });
+        }
+      );
+
+      wss.on('connection', (ws) => {
+        const received = [];
+        ws.on('message', (data) => received.push(data));
+        ws.on('close', () => {
+          assert.strictEqual(received.length, 1);
+        });
+      });
+    }
+  );
+
+  it(
+    'graceful close waits for all queued callbacks before close event; ' +
+      'callback order is FIFO and close event is last',
+    (done) => {
+      const order = [];
+
+      const wss = new WebSocket.Server(
+        { perMessageDeflate: true, port: 0 },
+        () => {
+          const ws = new WebSocket(`ws://localhost:${wss.address().port}`, {
+            perMessageDeflate: { threshold: 0 }
+          });
+
+          ws.on('open', () => {
+            for (let i = 0; i < 4; i++) {
+              ws.send(
+                Buffer.from(`msg-${i}-` + 'x'.repeat(2048)),
+                { compress: true, binary: true },
+                (err) => {
+                  assert.ifError(err);
+                  order.push(`cb-${i}`);
+                }
+              );
+            }
+            ws.close(1000);
+          });
+
+          ws.on('close', (code) => {
+            order.push('close-event');
+            assert.deepStrictEqual(order, [
+              'cb-0',
+              'cb-1',
+              'cb-2',
+              'cb-3',
+              'close-event'
+            ]);
+            assert.strictEqual(code, 1000);
+            wss.close(done);
+          });
+        }
+      );
+
+      wss.on('connection', (ws) => {
+        const received = [];
+        ws.on('message', (data) => received.push(data));
+        ws.on('close', () => {
+          assert.strictEqual(received.length, 4);
+        });
+      });
+    }
+  );
+
+  it('terminate during compression discards queued ping control frames too', (done) => {
+    const results = { dataCb: false, dataErr: null };
+
+    const wss = new WebSocket.Server(
+      { perMessageDeflate: { threshold: 0 }, port: 0 },
+      () => {
+        const ws = new WebSocket(`ws://localhost:${wss.address().port}`, {
+          perMessageDeflate: { threshold: 0 }
+        });
+
+        ws.on('open', () => {
+          ws.send(
+            makeLargeSnapshot(32 * 1024),
+            { compress: true, binary: true },
+            (err) => {
+              results.dataCb = true;
+              results.dataErr = err;
+            }
+          );
+          ws.ping(Buffer.from('keepalive'), true, () => {});
+
+          assert.strictEqual(ws._sender._state, DEFLATING);
+          ws.terminate();
+        });
+
+        ws.on('close', (code) => {
+          assert.strictEqual(code, 1006);
+          assert.ok(results.dataCb);
+          assert.ok(results.dataErr instanceof Error);
+          wss.close(done);
+        });
+      }
+    );
+
+    wss.on('connection', (ws) => {
+      let gotPing = false;
+      let gotMessage = false;
+      ws.on('message', () => {
+        gotMessage = true;
+      });
+      ws.on('ping', () => {
+        gotPing = true;
+      });
+      ws.on('close', () => {
+        assert.strictEqual(gotMessage, false);
+        assert.strictEqual(gotPing, false);
+      });
+    });
+  });
+});
