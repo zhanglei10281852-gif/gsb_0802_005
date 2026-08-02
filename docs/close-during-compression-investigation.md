@@ -529,7 +529,196 @@ reason 中表示"即将断开"，M0 仍有时间在 TCP 写通道关闭前发出
 
 ---
 
-## 7. 代码引用索引
+## 7. 评审结论：默认行为、配置影响与信号判读
+
+### 7.1 客户端与服务端的默认协商行为
+
+| 角色                               | `perMessageDeflate` 默认值 | 默认行为                                                                                                       | 源码位置                                                                                                                                                                                                                                                                                                       |
+| ---------------------------------- | -------------------------- | -------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 客户端（`new WebSocket(url)`）     | `true`                     | 主动在 Upgrade 请求中携带 `Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits`，请求启用压缩 | [websocket.js:677](file:///e:/newGsb/questions/GSB-005/Steve/lib/websocket.js#L677), [websocket.js:769-778](file:///e:/newGsb/questions/GSB-005/Steve/lib/websocket.js#L769-L778)                                                                                                                              |
+| 服务端（`new WebSocket.Server()`） | `false`                    | **不主动启用压缩**；只有显式设置 `perMessageDeflate: true` 或配置对象时，才解析客户端的扩展头并协商            | [websocket-server.js:76](file:///e:/newGsb/questions/GSB-005/Steve/lib/websocket-server.js#L76), [websocket-server.js:133](file:///e:/newGsb/questions/GSB-005/Steve/lib/websocket-server.js#L133), [websocket-server.js:298-321](file:///e:/newGsb/questions/GSB-005/Steve/lib/websocket-server.js#L298-L321) |
+
+**默认协商结果**：
+
+- 网关作为**服务端**时，若未显式配置
+  `perMessageDeflate: true`，即使客户端请求压缩，服务端也不会接受，所有消息均以未压缩帧传输。
+- 网关作为**客户端**（回源或连接上游）时，默认请求压缩；若上游服务端接受，则出站消息默认压缩（`WebSocket.send()`
+  的 `opts.compress` 默认为 `true`，见
+  [websocket.js:475](file:///e:/newGsb/questions/GSB-005/Steve/lib/websocket.js#L475)）。
+- 默认协商参数：`client_max_window_bits`（客户端通告支持），不启用
+  `*_no_context_takeover`，即**上下文接管默认开启**，压缩字典在消息之间复用。
+- `threshold`（默认 1024 字节）仅在 `*_no_context_takeover`
+  协商成功时生效。默认配置下上下文接管开启，**所有消息（包括小消息）都会压缩**，不受 threshold 影响（见
+  [sender.js:372-383](file:///e:/newGsb/questions/GSB-005/Steve/lib/sender.js#L372-L383)）。
+
+### 7.2 影响资源与排队表现的配置
+
+| 配置项                                                      | 默认值               | 影响维度                                                                                                | 高扇出场景注意事项                                                                                                                                                                                        | 源码位置                                                                                                                                                                                                                       |
+| ----------------------------------------------------------- | -------------------- | ------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `concurrencyLimit`                                          | `10`                 | **进程级全局** zlib 并发数。所有连接的压缩/解压操作共享同一个 `Limiter`，超出部分在 Limiter 队列中等待  | 高扇出时，即使单连接的 Sender 队列为空，压缩操作也可能因全局 zlib 线程池拥堵而排队。这会放大"正在压缩"的时间窗口，增加关闭时数据滞留的概率。该值在首次创建 `PerMessageDeflate` 实例时确定，后续实例不覆盖 | [permessage-deflate.js:65-71](file:///e:/newGsb/questions/GSB-005/Steve/lib/permessage-deflate.js#L65-L71), [limiter.js](file:///e:/newGsb/questions/GSB-005/Steve/lib/limiter.js)                                             |
+| `server_no_context_takeover` / `client_no_context_takeover` | `false`              | 每条消息后重置 deflate/inflate 字典。开启后压缩率略降，但内存占用不随消息历史增长，且 threshold 生效    | 高扇出服务端建议开启 `server_no_context_takeover`，避免每条连接的 deflate 流持有不断增长的压缩上下文内存。代价是压缩率降低和 CPU 开销略增                                                                 | [permessage-deflate.js:90-95](file:///e:/newGsb/questions/GSB-005/Steve/lib/permessage-deflate.js#L90-L95), [permessage-deflate.js:454-456](file:///e:/newGsb/questions/GSB-005/Steve/lib/permessage-deflate.js#L454-L456)     |
+| `threshold`                                                 | `1024`               | 仅在 `*_no_context_takeover` 启用时生效，小于此字节数的消息不压缩（RSV1=0）                             | 对快照行情（通常远大于 1KB）无影响；可减少小消息的 CPU 开销                                                                                                                                               | [permessage-deflate.js:56-57](file:///e:/newGsb/questions/GSB-005/Steve/lib/permessage-deflate.js#L56-L57), [sender.js:381](file:///e:/newGsb/questions/GSB-005/Steve/lib/sender.js#L381)                                      |
+| `zlibDeflateOptions` / `zlibInflateOptions`                 | `{}`                 | 透传给 `zlib.createDeflateRaw()` / `zlib.createInflateRaw()`，可设置 `level`、`memLevel`、`strategy` 等 | 降低 `level` 可减少 CPU 开销但压缩率下降；降低 `memLevel` 可减少内存但影响压缩率和性能                                                                                                                    | [permessage-deflate.js:414-417](file:///e:/newGsb/questions/GSB-005/Steve/lib/permessage-deflate.js#L414-L417), [permessage-deflate.js:349-352](file:///e:/newGsb/questions/GSB-005/Steve/lib/permessage-deflate.js#L349-L352) |
+| `closeTimeout`                                              | `30000`（30 秒）     | `close()` 后等待关闭握手完成的超时；超时强制 `socket.destroy()`                                         | 高扇出优雅下线时，30 秒可能过长。可调小以加速连接回收，但会增加内核发送缓冲区中未发出数据丢失的风险                                                                                                       | [constants.js:10](file:///e:/newGsb/questions/GSB-005/Steve/lib/constants.js#L10), [websocket.js:1309-1314](file:///e:/newGsb/questions/GSB-005/Steve/lib/websocket.js#L1309-L1314)                                            |
+| `maxPayload`                                                | `104857600`（100MB） | 接收侧解压后消息的最大字节数，超出则以 1009 关闭连接                                                    | 快照推送方向为出站时影响不大；若接收客户端的大消息，需注意此限制                                                                                                                                          | [websocket.js:675](file:///e:/newGsb/questions/GSB-005/Steve/lib/websocket.js#L675), [receiver.js:439-453](file:///e:/newGsb/questions/GSB-005/Steve/lib/receiver.js#L439-L453)                                                |
+
+**关键资源特征**：
+
+- 每条启用压缩的连接持有独立的 `_deflate` 和 `_inflate`
+  zlib 流（[permessage-deflate.js:60-61](file:///e:/newGsb/questions/GSB-005/Steve/lib/permessage-deflate.js#L60-L61)）。上下文接管开启时，这些流的内存随消息历史增长。
+- 压缩操作是异步的，通过 libuv 线程池执行。Node.js 默认线程池大小为 4，`concurrencyLimit`
+  默认 10 意味着最多 10 个压缩/解压操作在线程池队列中等待。
+- Sender 队列（`_queue`）是单连接级别的 FIFO 数组，无大小上限。高扇出时若单连接发送速度超过网络传输速度，队列会无限增长（`_bufferedBytes`
+  持续累加）。
+
+### 7.3 只能说明本机进度、不能代表交付完成的信号
+
+| 信号                      | 本机含义                                            | 不能推断的内容                                                        | 证据来源                                                                                         |
+| ------------------------- | --------------------------------------------------- | --------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `ws.send()` 同步返回      | 消息已被 Sender 接收（边界 A）                      | 消息尚未压缩、未写入 socket、未经过网络                               | [sender.js:411-413](file:///e:/newGsb/questions/GSB-005/Steve/lib/sender.js#L411-L413)           |
+| `send` 回调 `cb(null)`    | 帧已通过 `socket.write()` 交给本机 TCP 栈（边界 B） | 对端未 ACK、未解析帧、未解压、未触发 `'message'`                      | [sender.js:563-572](file:///e:/newGsb/questions/GSB-005/Steve/lib/sender.js#L563-L572)           |
+| `ws.bufferedAmount === 0` | 本机 Sender 队列和内核发送缓冲区均为空              | 不代表对端已收到或处理；数据可能在网络中或对端内核缓冲区              | [websocket.js:120-124](file:///e:/newGsb/questions/GSB-005/Steve/lib/websocket.js#L120-L124)     |
+| `ws.readyState === OPEN`  | 本端 WebSocket 状态机处于打开                       | 不代表对端仍然存活或网络可达                                          | [websocket.js:67](file:///e:/newGsb/questions/GSB-005/Steve/lib/websocket.js#L67)                |
+| close 事件码 `1000`       | 双向 close 帧握手完成                               | 不保证 close 帧之前的所有数据帧已被对端应用层处理                     | [websocket.js:302-340](file:///e:/newGsb/questions/GSB-005/Steve/lib/websocket.js#L302-L340)     |
+| `'open'` 事件触发         | WebSocket 握手完成，Sender/Receiver 已创建          | 不代表对端应用层已准备好接收数据                                      | [websocket.js:257-258](file:///e:/newGsb/questions/GSB-005/Steve/lib/websocket.js#L257-L258)     |
+| `'pong'` 事件             | 收到对端的 pong 帧                                  | 仅证明对端 TCP/WebSocket 协议栈存活，不证明对端应用层处理了之前的消息 | [websocket.js:1261-1263](file:///e:/newGsb/questions/GSB-005/Steve/lib/websocket.js#L1261-L1263) |
+
+**监控台账应区分的状态**：
+
+- `accepted`（边界 A）：`send()` 返回成功，可以计入"已提交发送层"。
+- `flushed`（边界 B）：`cb(null)` 执行，可以计入"已写入本机 socket"。
+- `confirmed`（边界 C）：收到对端应用层 ACK，可以计入"对端已确认"——**此状态无法从 ws 库获得，必须在应用层实现**。
+- `failed`：`cb(Error)` 执行，可以计入"发送失败，需重发"。
+
+### 7.4 最终建议
+
+#### 建议一：高扇出网关的压缩配置
+
+**适用条件**：网关作为 WebSocket 服务端，单进程维护数千条长连接，推送以大快照（>1KB）为主。
+
+**建议配置**：
+
+```js
+const wss = new WebSocket.Server({
+  perMessageDeflate: {
+    serverNoContextTakeover: true,
+    concurrencyLimit: 10,
+    threshold: 1024
+  },
+  closeTimeout: 5000
+  // ... 其他选项
+});
+```
+
+**理由**：
+
+- `serverNoContextTakeover: true`：限制每条连接的 deflate 流内存不随消息历史增长，对高扇出场景的内存可控性至关重要。上下文接管带来的压缩率提升对大快照收益有限，而内存风险在数千连接下会放大。
+- `threshold: 1024`：配合 noContextTakeover，小消息不压缩，减少 zlib 线程池压力。
+- `closeTimeout: 5000`：优雅下线时 5 秒足够已排队数据写入 socket，避免 30 秒过长导致连接堆积。但需确认业务能接受 5 秒后未发出数据丢失的风险。
+- `concurrencyLimit`：默认 10 在大多数场景下足够；若 CPU 核心数较多且快照压缩成为瓶颈，可适当调高，但需监控 zlib 线程池延迟。
+
+**不建议**：在高扇出服务端使用默认的上下文接管（即不设置
+`serverNoContextTakeover`），因为每条连接的压缩字典会持续增长。
+
+#### 建议二：台账状态机
+
+**适用条件**：需要追踪每笔消息的投递状态，用于关闭时判断是否需要重发或对账。
+
+**建议**：使用三级状态机，不跨越边界推断：
+
+| 状态          | 进入条件                                    | 退出条件                                                        | 可用于                                                         |
+| ------------- | ------------------------------------------- | --------------------------------------------------------------- | -------------------------------------------------------------- |
+| `accepted`    | `ws.send()` 同步返回                        | `cb(null)` → `flushed`；`cb(Error)` → `failed`                  | 判断消息已提交，但不能用于判断是否需要重发（关闭时仍可能成功） |
+| `flushed`     | `cb(null)`                                  | 收到对端 ACK → `confirmed`；连接异常关闭（1006）→ `unconfirmed` | 判断消息已离开本机，但不能标记为"已送达"                       |
+| `confirmed`   | 对端应用层 ACK 到达                         | —                                                               | 唯一可标记为"对端已送达"的状态                                 |
+| `failed`      | `cb(Error)` 或连接 1006 且未到 `flushed`    | —                                                               | 消息未离开本机，应重发                                         |
+| `unconfirmed` | 已 `flushed` 但连接异常关闭（1006）且无 ACK | —                                                               | 消息可能已到达对端也可能丢失，需业务层对账                     |
+
+**关键规则**：
+
+- `close` 码 1000 + `flushed` 状态：消息大概率已发出，但在收到 ACK 前不应标记为
+  `confirmed`。
+- `close` 码 1006 + `flushed` 状态：标记为
+  `unconfirmed`，不自动重发（可能导致重复），等待业务层对账。
+- `close` 码 1006 + `accepted` 状态（回调未执行）：标记为 `failed`，可安全重发。
+
+#### 建议三：优雅关闭流程
+
+**适用条件**：网关需要滚动重启或主动断开连接，希望尽量减少消息丢失。
+
+**建议流程**：
+
+1. 停止向该连接调用新的 `ws.send()`。
+2. 等待所有已 `accepted` 消息的回调执行（到达 `flushed` 或 `failed`）。可通过
+   `ws.bufferedAmount` 和回调计数判断。
+3. 对于 `failed` 的消息，触发业务层重发逻辑。
+4. 调用 `ws.close(code)`，等待 `'close'` 事件。
+5. 若 `closeTimeout` 超时触发 `socket.destroy()`，所有未到 `flushed`
+   的消息标记为 `failed`。
+
+**不建议**在未等待回调的情况下直接 `ws.close()` 后假设数据已发出。虽然 `close()`
+会排队等待数据写入，但写入成功只代表边界 B，且 `closeTimeout`
+超时仍可能丢弃数据。
+
+### 7.5 剩余风险
+
+以下风险无法通过配置或台账完全消除，属于 WebSocket/TCP 协议和本库设计的固有约束：
+
+1. **边界 B 之后的网络丢失**：`cb(null)`
+   后数据仍在内核发送缓冲区或网络中，TCP 重传失败、对端 RST、进程崩溃等都可能导致数据丢失。本库不提供应用层 ACK，无法检测此类丢失。
+   - 证据：测试 "callback success at boundary B does not survive a subsequent
+     terminate" 验证了 `cb(null)` 后 `terminate()` 仍可导致 close 码 1006。
+
+2. **对端应用层未处理**：即使对端 TCP 栈 ACK 了数据，对端的 WebSocket
+   Receiver 可能还在解压队列中，或应用层 `'message'`
+   回调尚未执行。对端在此期间关闭连接，数据不会触发 `'message'`。
+   - 证据：[websocket.js:1177](file:///e:/newGsb/questions/GSB-005/Steve/lib/websocket.js#L1177)
+     在收到 close 帧后立即移除 `'data'`
+     监听器，虽然已缓冲的数据会被 flush（[websocket.js:1339-1348](file:///e:/newGsb/questions/GSB-005/Steve/lib/websocket.js#L1339-L1348)），但对端应用层是否处理取决于其消费速度。
+
+3. **全局 zlib 排队导致的关闭窗口放大**：`concurrencyLimit`
+   是进程级全局限制。高扇出时，一笔大快照的压缩可能被 zlib 线程池延迟，在此期间连接被关闭的概率增加。Sender 队列中的消息在
+   `terminate()` 时会全部失败。
+   - 证据：[permessage-deflate.js:65-71](file:///e:/newGsb/questions/GSB-005/Steve/lib/permessage-deflate.js#L65-L71)
+     确认 `zlibLimiter` 是模块级变量；测试 timing
+     2 验证了排队消息在 terminate 时全部收到错误。
+
+4. **`closeTimeout` 超时丢数据**：`close()` 启动的定时器超时后调用
+   `socket.destroy()`，此时内核发送缓冲区中尚未被 TCP 栈发出的数据会被丢弃，且这些数据已经过了边界 B（`cb(null)`
+   已执行）。台账会显示 `flushed` 但数据实际丢失。
+   - 证据：[websocket.js:1309-1314](file:///e:/newGsb/questions/GSB-005/Steve/lib/websocket.js#L1309-L1314)
+     确认超时直接 `socket.destroy()`。
+
+5. **无背压的无限队列**：Sender 的 `_queue` 数组无大小上限。若应用层 `send()`
+   速度持续超过网络传输速度，队列会无限增长，`bufferedAmount`
+   持续上升，最终导致内存溢出。本库不提供队列水位限制或 `'drain'` 事件。
+   - 证据：[sender.js:551-554](file:///e:/newGsb/questions/GSB-005/Steve/lib/sender.js#L551-L554)
+     的 `enqueue()` 仅做 push，无大小检查。
+
+### 7.6 本地证据索引
+
+所有结论均由以下本地证据支撑：
+
+| 结论                                    | 证据类型                               | 位置                                                                                                                                                                                                            |
+| --------------------------------------- | -------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| close 帧排在压缩消息之后（FIFO）        | 测试 scenario B + timing 1             | [test/close-during-compression.test.js:92-144](file:///e:/newGsb/questions/GSB-005/Steve/test/close-during-compression.test.js#L92-L144)                                                                        |
+| terminate 丢弃压缩中和排队的消息        | 测试 scenario C + timing 2             | [test/close-during-compression.test.js:146-192](file:///e:/newGsb/questions/GSB-005/Steve/test/close-during-compression.test.js#L146-L192)                                                                      |
+| 对端关闭不影响出站压缩数据              | 测试 scenario H + timing 3             | [test/close-during-compression.test.js:394-434](file:///e:/newGsb/questions/GSB-005/Steve/test/close-during-compression.test.js#L394-L434)                                                                      |
+| cb(null) 不等于对端收到                 | 测试 scenario E + boundary B+terminate | [test/close-during-compression.test.js:249-291](file:///e:/newGsb/questions/GSB-005/Steve/test/close-during-compression.test.js#L249-L291)                                                                      |
+| close() 后 send() 被拒绝                | 测试 scenario F + late send            | [test/close-during-compression.test.js:293-336](file:///e:/newGsb/questions/GSB-005/Steve/test/close-during-compression.test.js#L293-L336)                                                                      |
+| 回调 FIFO 顺序，close 事件在最后        | 测试 FIFO order                        | [test/close-during-compression.test.js:735-785](file:///e:/newGsb/questions/GSB-005/Steve/test/close-during-compression.test.js#L735-L785)                                                                      |
+| 排队中的 ping 也被 terminate 丢弃       | 测试 queued ping                       | [test/close-during-compression.test.js:787-839](file:///e:/newGsb/questions/GSB-005/Steve/test/close-during-compression.test.js#L787-L839)                                                                      |
+| 客户端默认请求压缩                      | 源码                                   | [websocket.js:677](file:///e:/newGsb/questions/GSB-005/Steve/lib/websocket.js#L677)                                                                                                                             |
+| 服务端默认不启用压缩                    | 源码                                   | [websocket-server.js:76](file:///e:/newGsb/questions/GSB-005/Steve/lib/websocket-server.js#L76)                                                                                                                 |
+| zlibLimiter 是全局单例                  | 源码                                   | [permessage-deflate.js:24](file:///e:/newGsb/questions/GSB-005/Steve/lib/permessage-deflate.js#L24), [permessage-deflate.js:65-71](file:///e:/newGsb/questions/GSB-005/Steve/lib/permessage-deflate.js#L65-L71) |
+| threshold 仅在 noContextTakeover 时生效 | 源码                                   | [sender.js:372-383](file:///e:/newGsb/questions/GSB-005/Steve/lib/sender.js#L372-L383)                                                                                                                          |
+| closeTimeout 超时 destroy socket        | 源码                                   | [websocket.js:1309-1314](file:///e:/newGsb/questions/GSB-005/Steve/lib/websocket.js#L1309-L1314)                                                                                                                |
+
+运行全部证据：`npx mocha test/close-during-compression.test.js --timeout 10000`（15 个用例全部通过）。
+
+---
+
+## 8. 代码引用索引
 
 | 机制                                | 文件                                                                                         | 关键行                                                                                                                                                         |
 | ----------------------------------- | -------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
