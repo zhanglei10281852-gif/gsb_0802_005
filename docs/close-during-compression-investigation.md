@@ -188,15 +188,22 @@ close 回调置 _closeFrameSent=true；若对端关闭帧已到则 socket.end()
 ## 七、复现场景
 
 [`test/close-during-compression.test.js`](../test/close-during-compression.test.js) 用仓库现有测试工具
-（`mocha` + `assert` + 真实的 `WebSocket.Server` / `WebSocket` 客户端，不新增依赖）复现两种结局：
+（`mocha` + `assert` + 真实的 `WebSocket.Server` / `WebSocket` 客户端，不新增依赖）复现四种结局，对应
+第八节的时序对比：
 
-1. **优雅关闭 + 压缩快照**：客户端 `send(大快照)` 后立即 `close(1000)`。断言：
+1. **本机优雅关闭 + 压缩快照（时序①）**：客户端 `send(大快照)` 后立即 `close(1000)`。断言：
    - 边界 A：`send()` 返回时仍 `OPEN`、`bufferedAmount > 0`、回调尚未触发；
    - 边界 B：`'close'` 前回调无错触发，且 socket 未被销毁；
    - 对端收到：服务端拼接收到的分片，长度与内容与原快照完全一致，关闭码为 1000。
 2. **压缩途中被拆链**：服务端在握手后立即 `_socket.end()`，客户端仍在压缩快照。断言 `send()` 回调
    带 `'The socket was closed while data was being compressed'` 错误、`readyState === CLOSING`——即
    **未达边界 B**。
+3. **本机 `terminate()`（时序②）**：客户端 `send` 两条快照（第一条 DEFLATING、第二条排队）后
+   `terminate()`。断言**两个**回调都带 `'The socket was closed while data was being compressed'` 错误
+   ——在途的与排队的一并失败，验证 `callCallbacks` 遍历整条队列的行为。
+4. **对端优雅关闭（时序③）**：客户端只 `send(大快照)`、**从不**自己 `close()`；服务端在压缩未结束时
+   `close(1001)`。断言快照回调仍无错触发（边界 B）、socket 未被销毁，且对端字节级完整收到、关闭码
+   1001——证明"对端发起的优雅关闭"与"本机优雅关闭"对在途快照的效果一致。
 
 运行：
 
@@ -204,4 +211,56 @@ close 回调置 _closeFrameSent=true；若对端关闭帧已到则 socket.end()
 npx mocha --throw-deprecation test/close-during-compression.test.js
 ```
 
-两个用例均通过，覆盖了压缩消息与优雅关闭相遇时能观察到的两种结果。
+四个用例均通过，覆盖了压缩消息与不同关闭时序相遇时能观察到的结果（下一节详列）。
+
+---
+
+## 八、三种关闭时序对比（供投递台账映射）
+
+接入团队要把 `send()` 回调接到投递台账，需要知道**哪些状态能记为"本机已接收"（边界 B），哪些
+绝不能写成"对端已送达"**。下面按"一条压缩快照正在 zlib 线程池里压缩(`_state = DEFLATING`)"这个
+统一起点，比较三种关闭时序。判定的**唯一分叉点**都在
+[dispatch 的压缩回调](../lib/sender.js#L513-L528)：压缩完成时 `this._socket.destroyed` 是真还是假。
+
+| 时序 | 触发路径 | 压缩回调看到 `socket.destroyed` | 正在压缩的快照 | 排队中的后续发送 | send 回调 | `'close'` 事件 |
+|---|---|---|---|---|---|---|
+| ① 本机主动**优雅**关闭 `close()` | [WebSocket#close](../lib/websocket.js#L302-L340) → [Sender#close 入队](../lib/sender.js#L224-L228) → 顺序 `end()` | **false**（`end()` 不销毁） | **压缩→写出→对端收到** | 关闭帧排在快照之后，依次写出 | **无错**（边界 B） | 正常，`code` 为应用传入值 |
+| ② 本机**强制**终止 `terminate()` | [WebSocket#terminate](../lib/websocket.js#L492-L504) → `socket.destroy()` | **true** | **从未写出** | [callCallbacks 遍历队列](../lib/sender.js#L585-L594)集体报错 | **带错** `The socket was closed while data was being compressed` | 触发，`code=1006` |
+| ③ **对端**在压缩未结束时开始关闭 | 收到对端关闭帧 → [receiverOnConclude](../lib/websocket.js#L1168-L1182) → 本机 `close()` → 顺序 `end()` | **false** | **压缩→写出→对端收到** | 关闭帧排在快照之后，依次写出 | **无错**（边界 B） | 触发，`code` 为对端所发（如 1001） |
+
+要点解读：
+
+- **①③ 本质相同**：无论关闭由本机还是对端发起，只要走的是**优雅**路径（`socket.end()`），在途快照
+  都不会被中断。区别仅在 `close` 事件的 `code` 来源和谁先发关闭帧。③ 中即使应用**根本没调用
+  `close()`**，快照回调仍会无错触发到达边界 B（见复现用例 4）。
+- **② 是唯一会丢在途数据的常见路径**：`terminate()` 同步 `destroy()` socket，导致压缩回调命中
+  `socket.destroyed`。此时**不仅在压缩的这条**，**排在它后面的整条队列**的回调都会以同一错误信息被
+  调用（见复现用例 3）。同源路径还有：对端 RST / socket `'error'`（[socketOnError](../lib/websocket.js#L1397-L1407)）、
+  连接异常 `'close'`（[socketOnClose](../lib/websocket.js#L1321-L1365)）。
+- **`bufferedAmount` 在三种时序下的读数不能作为投递依据**：它只反映库内队列 + 本机 socket 写缓冲，
+  归零至多约等于"全部到达边界 B"，与对端是否收到无关。
+
+> 为何现有实现是这样：库把"是否还能安全写出"归结为一个**单一、可判定**的信号——
+> `socket.destroyed`。优雅关闭用 `end()` 保留写方向直到缓冲排空，所以在途压缩能完成；强制终止用
+> `destroy()` 立即放弃写方向，所以在途压缩被判定为失败。这是**有意的顺序保证 + 快速失败**取舍，而非
+> 缺陷，也因此**回调成功只可能意味着到达边界 B，永远不表示对端已收到**。
+
+---
+
+## 九、投递台账映射规则（必须遵守）
+
+把 `send(data, cb)` 的回调接入台账时，按下表记账。**"对端已送达"这一状态，任何库内信号都不可推出**，
+只能由应用层 ACK 置位：
+
+| 观测到的状态 | 可记为 | 绝不可记为 |
+|---|---|---|
+| `send()` 未抛异常且当时 `readyState === OPEN`，回调尚未触发 | `本机已入队`（边界 A） | 本机已发送 / 对端已送达 |
+| 回调触发且 `err == null` | `本机已发送`（边界 B，帧入本机 OS 发送缓冲） | **对端已送达** |
+| 回调触发且 `err.message === 'The socket was closed while data was being compressed'` | `发送失败-未写出`（时序②及同源路径） | 本机已发送 / 对端已送达 |
+| 回调触发且 `err.message` 以 `WebSocket is not open: readyState` 开头 | `发送失败-连接非 OPEN`（数据未入队） | 本机已入队 / 已发送 / 对端已送达 |
+| `'close'` 事件（任意 `code`，含 1000/1001/1006） | `连接已关闭` | 在途/历史消息对端已送达 |
+| `bufferedAmount === 0` | `本机缓冲已排空`（约等于均达边界 B） | 对端已送达 |
+
+**红线**：边界 B（回调 `err == null`）只证明"本机已把压缩帧交给 OS 发送缓冲"。它与"对端已送达"之间
+仍隔着本机内核缓冲、物理网络、对端内核缓冲、对端解帧与**异步解压**、对端事件派发（见第五节图）。
+台账里的"对端已送达"列**必须**由对端应用回传的 ACK/序号确认驱动，不得由 `ws` 的任何回调或事件推断。
