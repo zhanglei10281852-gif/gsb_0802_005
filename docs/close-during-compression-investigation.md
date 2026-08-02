@@ -264,3 +264,76 @@ npx mocha --throw-deprecation test/close-during-compression.test.js
 **红线**：边界 B（回调 `err == null`）只证明"本机已把压缩帧交给 OS 发送缓冲"。它与"对端已送达"之间
 仍隔着本机内核缓冲、物理网络、对端内核缓冲、对端解帧与**异步解压**、对端事件派发（见第五节图）。
 台账里的"对端已送达"列**必须**由对端应用回传的 ACK/序号确认驱动，不得由 `ws` 的任何回调或事件推断。
+
+---
+
+## 十、发布评审结论（高扇出连接是否启用压缩 + 台账/监控观察什么）
+
+本节把前两轮验证过的**发送边界**（边界 A/B，第一~三节）与**关闭/压缩时序**（第八节）收敛为可直接
+评审的结论。所有判断均有本地证据支撑，未修改库实现、未包装 API、未伪造确认。
+
+### 10.1 默认协商行为（客户端 vs 服务端）
+
+| 端 | `perMessageDeflate` 默认值 | 行为 | 证据 |
+|---|---|---|---|
+| 客户端 | **`true`** | 每次握手都在 `Sec-WebSocket-Extensions` 里**主动 offer** 压缩 | [initAsClient 默认](../lib/websocket.js#L677)、[写 offer](../lib/websocket.js#L769-L778) |
+| 服务端 | **`false`** | 即使客户端 offer 也**不接受、不压缩**；须显式开启才协商 | [WebSocketServer 默认](../lib/websocket-server.js#L76)、[仅在开启时 accept](../lib/websocket-server.js#L297-L313) |
+
+**含义**：压缩是否真正生效由**服务端**拍板。网关作为服务端，只要保持默认 `perMessageDeflate: false`，
+高扇出连接就**不会**走压缩路径——本调查描述的"压缩与关闭相遇"窗口自然不存在。反之一旦服务端开启，
+则第一~九节的全部时序与边界结论适用。协商成功后，具体某条消息是否加 RSV1 还要过阈值判断
+（`*_no_context_takeover` 且 `byteLength < threshold` 时不压，见 [sender.js](../lib/sender.js#L371-L390)）。
+
+### 10.2 影响资源与排队表现的配置
+
+| 配置 | 默认 | 对高扇出的影响 | 证据 |
+|---|---|---|---|
+| `perMessageDeflate.concurrencyLimit` | 10 | **进程级全局**限流，被**所有连接共享**（`zlibLimiter` 是模块级单例）。高扇出下这是压缩排队的总闸门：超过并发的 `compress()` 会排队，拉长边界 A→B 的间隔 | [全局 limiter](../lib/permessage-deflate.js#L17-L71)、[compress 经 limiter](../lib/permessage-deflate.js#L322-L329) |
+| `perMessageDeflate.threshold` | 1024 | 仅在协商了 `*_no_context_takeover` 时对**小消息**跳过压缩，减少无谓 zlib 调用；大快照不受益 | [sender.js](../lib/sender.js#L371-L390) |
+| `perMessageDeflate.*_no_context_takeover` / `*MaxWindowBits` | 关 | 关闭上下文接管可省内存、允许触发 threshold 跳过，但压缩率下降 | [offer/accept](../lib/permessage-deflate.js#L87-L235) |
+| `perMessageDeflate.zlibDeflateOptions`（如 `memLevel`/`level`） | zlib 默认 | 每个启用压缩的连接各持一个 deflate 流，`memLevel`/窗口直接决定**每连接常驻内存**；高扇出下按连接数线性放大 | [每连接建流](../lib/permessage-deflate.js#L404-L423) |
+| `maxPayload` | 100MB | 解压侧上限，超限报 1009 并关闭；影响接收而非发送排队 | [inflateOnData](../lib/permessage-deflate.js#L482-L506) |
+| `closeTimeout` | 30000ms | 优雅关闭兜底：到期 `socket.destroy()`。若在途压缩/写出迟迟不完成，最坏等这么久才强制拆链 | [setCloseTimer](../lib/websocket.js#L1309-L1314)、[常量](../lib/constants.js#L10) |
+
+**高扇出要点**：压缩的代价是**内存（每连接 deflate 流）+ 排队（全局并发闸门）**。连接数越多，
+`concurrencyLimit` 越容易成为瓶颈，边界 A→B 的间隔越长，落在这个间隔里的关闭越多——即本调查现象在
+高峰期更频繁，但结论（优雅关闭仍投递、强制终止丢在途）不变。
+
+### 10.3 只代表本机进度、不代表交付完成的信号（监控/台账须区分）
+
+| 信号 | 真实含义 | 上限 |
+|---|---|---|
+| `send()` 返回不抛异常（`OPEN`） | 边界 A：数据被 `Sender` 接管 | 未成帧/未压缩/未写 socket |
+| `send()` 回调 `err == null` | 边界 B：压缩帧进本机 OS 发送缓冲 | **不代表对端收到** |
+| `bufferedAmount === 0` | 库队列 + 本机 socket 写缓冲已排空 | ≈全部到边界 B，**不代表对端收到** |
+| `'close'` 事件（含 1000/1001） | 本机连接已关闭 | 不代表在途/历史消息已被对端消费 |
+| `sender._bufferedBytes` / `_socket._writableState.length` | 本机排队深度（可作背压/健康度） | 纯本机指标 |
+
+**交付完成**只能由**应用层 ACK/序号确认**判定（第五、九节红线）。监控看板建议：把上述本机指标归入
+"本机进度/背压"分区，"对端已送达"单独由业务 ACK 驱动，二者不得混算。
+
+### 10.4 最终建议与适用条件
+
+1. **高扇出连接默认不建议开压缩**：网关作为服务端，保持 `perMessageDeflate: false`（库默认）即可回避
+   全局并发闸门、每连接内存放大以及压缩期关闭窗口。**适用条件**：带宽不是瓶颈、快照可接受不压缩体积。
+2. **确需压缩时**：显式开启并**限定内存**（下调 `zlibDeflateOptions.memLevel`/窗口、酌情
+   `*_no_context_takeover`），据实测调 `concurrencyLimit`；接受边界 A→B 间隔变长。**适用条件**：带宽
+   受限且已为每连接内存与全局并发做过容量规划。
+3. **关闭一律走优雅 `close()`，禁用 `terminate()` 于正常收尾**：优雅关闭保住在途快照（时序①③），
+   `terminate()` 会让在途+排队发送全部失败（时序②，用例 3 已证）。
+4. **台账/监控严格按 10.3 与第九节记账**：`err == null` 只记"本机已发送"，"对端已送达"仅由 ACK 置位。
+
+### 10.5 剩余风险与对应本地证据
+
+| 剩余风险 | 说明 | 本地证据 |
+|---|---|---|
+| 压缩期强制拆链丢在途数据 | `terminate()`/对端 RST/socket error 时，在途+排队发送回调集体报错，数据未写出 | 用例 3（[test](../test/close-during-compression.test.js)）、[callCallbacks](../lib/sender.js#L585-L594) |
+| 边界 B 被误当交付完成 | 回调成功仅到本机 OS 缓冲，对端解压/派发仍可能失败或滞后 | 用例 1/4 断言"边界 B 成功"与"对端收到"是两处独立断言；第五节链路图 |
+| 高扇出下压缩排队放大 | 全局 `concurrencyLimit` 被所有连接共享，峰值期拉长 A→B 间隔 | [全局 limiter](../lib/permessage-deflate.js#L17-L71)（结构性证据；本地未做压测） |
+| `closeTimeout` 期间资源占用 | 优雅关闭最坏等 30s 才强制拆链，期间连接与 deflate 流仍占内存 | [setCloseTimer](../lib/websocket.js#L1309-L1314) |
+| 对端优雅关闭易被误读为"本机主动关" | 时序③中应用未调 `close()` 也会收到成功回调 + `'close'`，`code` 来自对端 | 用例 4（`code=1001`、socket 未销毁） |
+
+> 一致性复查：10.1 的默认值与 §一致（客户端 offer / 服务端默认不接受）；10.2/10.5 的并发闸门、每连接
+> deflate 流、`closeTimeout` 均引自第二、四节同一批源码位置；10.3/10.4 的边界与时序结论与第三、五、
+> 八、九节完全一致，**未出现"回调成功＝对端收到"这类被削弱的表述**。新增实验（用例 1–4，第七节）与
+> 源码解释相互印证，无矛盾。
